@@ -24,7 +24,7 @@ struct Telemetry {
     theta: f64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum MenuItem {
     // Robot Local
     Bringup,
@@ -82,6 +82,8 @@ enum Screen {
     Splash,
     DeviceSelect,
     MapNameInput,
+    TeleopConfig,
+    MapSelect,
     Main,
 }
 
@@ -98,6 +100,12 @@ struct App {
     device_type: DeviceType,
     selection_index: usize,
     map_name_input: String,
+    teleop_speed: String,
+    teleop_turn: String,
+    teleop_field_index: usize,
+    pending_teleop_item: Option<MenuItem>,
+    available_maps: Vec<String>,
+    map_selection_index: usize,
 }
 
 impl App {
@@ -130,6 +138,12 @@ impl App {
             device_type: DeviceType::Unselected,
             selection_index: 0,
             map_name_input: String::new(),
+            teleop_speed: "0.2".to_string(),
+            teleop_turn: "0.8".to_string(),
+            teleop_field_index: 0,
+            pending_teleop_item: None,
+            available_maps: Vec::new(),
+            map_selection_index: 0,
         }
     }
 
@@ -196,6 +210,23 @@ impl App {
         results
     }
 
+    fn update_maps_list(&mut self) {
+        self.available_maps.clear();
+        let maps_path = "/home/pidev/titan_ws/src/titan_bringup/maps/";
+        if let Ok(entries) = std::fs::read_dir(maps_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("yaml") {
+                    if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
+                        self.available_maps.push(file_name.to_string());
+                    }
+                }
+            }
+        }
+        self.available_maps.sort();
+        self.map_selection_index = 0;
+    }
+
     fn on_tick(&mut self) {
         if self.telemetry_rx.has_changed().unwrap_or(false) {
             let data = self.telemetry_rx.borrow_and_update();
@@ -204,9 +235,24 @@ impl App {
     }
 
     fn execute_selected(&mut self) {
-        let menu_items = self.get_filtered_menu();
-        if self.active_menu_index >= menu_items.len() { return; }
-        let item = menu_items[self.active_menu_index].clone();
+        let item = if self.screen == Screen::TeleopConfig {
+            self.pending_teleop_item.clone().unwrap_or(MenuItem::LocalTeleop)
+        } else {
+            let menu_items = self.get_filtered_menu();
+            if self.active_menu_index >= menu_items.len() { return; }
+            menu_items[self.active_menu_index].clone()
+        };
+
+        if self.screen != Screen::TeleopConfig && (item == MenuItem::LocalTeleop || item == MenuItem::RemoteTeleop) {
+            self.pending_teleop_item = Some(item);
+            self.screen = Screen::TeleopConfig;
+            self.teleop_field_index = 0;
+            return;
+        }
+
+        if self.screen == Screen::TeleopConfig {
+            self.screen = Screen::Main;
+        }
         
         match item {
             MenuItem::Battery => {
@@ -220,25 +266,56 @@ impl App {
                 }
             },
             _ => {
+                if self.screen != Screen::MapSelect && item == MenuItem::Navigation {
+                    self.update_maps_list();
+                    if self.available_maps.is_empty() {
+                        self.logs.push("Error: No maps found in 'titan_bringup/maps/'!".to_string());
+                        return;
+                    }
+                    self.screen = Screen::MapSelect;
+                    return;
+                }
+
+                if self.screen == Screen::MapSelect {
+                    self.screen = Screen::Main;
+                }
+
                 self.logs.push(format!("Executing: {}", item.to_string()));
                 match item {
                     MenuItem::Bringup => self.spawn_ros_launch("bringup.launch.py"),
                     MenuItem::Mapping => self.spawn_ros_launch("mapping.launch.py"),
-                    MenuItem::Navigation => self.spawn_ros_launch("navigation.launch.py"),
+                    MenuItem::Navigation => {
+                        let map_file = if self.available_maps.is_empty() {
+                            "map.yaml".to_string()
+                        } else {
+                            self.available_maps[self.map_selection_index].clone()
+                        };
+                        let map_arg = format!("map:={}", map_file);
+                        self.spawn_ros_launch_with_args("navigation.launch.py", vec![&map_arg]);
+                    },
                     MenuItem::LocalTeleop => {
                         let is_tmux = std::env::var("TMUX").is_ok();
+                        let speed = if self.teleop_speed.is_empty() { "0.2" } else { &self.teleop_speed };
+                        let turn = if self.teleop_turn.is_empty() { "0.8" } else { &self.teleop_turn };
+                        let ros_args = format!("--ros-args -p speed:={} -p turn:={}", speed, turn);
+                        
                         if is_tmux {
-                            self.logs.push("Spawning Teleop in split...".to_string());
+                            self.logs.push(format!("Spawning Teleop (s={}, t={}) in split...", speed, turn));
+                            let tmux_cmd = format!("ros2 run teleop_twist_keyboard teleop_twist_keyboard {}", ros_args);
                             let _ = Command::new("tmux")
-                                .args(["split-window", "-h", "ros2 run teleop_twist_keyboard teleop_twist_keyboard"])
+                                .args(["split-window", "-h", &tmux_cmd])
                                 .spawn();
                         } else {
                             self.logs.push("Error: Local Teleop requires tmux split!".to_string());
                         }
                     },
                     MenuItem::RemoteTeleop => {
-                        self.logs.push("Spawning Remote Teleop in new window...".to_string());
-                        let cmd_str = "gnome-terminal -- bash -c 'ros2 run teleop_twist_keyboard teleop_twist_keyboard; exec bash'";
+                        let speed = if self.teleop_speed.is_empty() { "0.2" } else { &self.teleop_speed };
+                        let turn = if self.teleop_turn.is_empty() { "0.8" } else { &self.teleop_turn };
+                        let ros_args = format!("--ros-args -p speed:={} -p turn:={}", speed, turn);
+
+                        self.logs.push(format!("Spawning Remote Teleop (s={}, t={}) in new window...", speed, turn));
+                        let cmd_str = format!("gnome-terminal -- bash -c 'ros2 run teleop_twist_keyboard teleop_twist_keyboard {}; exec bash'", ros_args);
                         let _ = Command::new("bash").arg("-c").arg(cmd_str).spawn().map(|child| self.active_process = Some(child));
                     },
                     MenuItem::RemoteRViz => {
@@ -270,7 +347,12 @@ impl App {
     }
 
     fn spawn_ros_launch(&mut self, file: &str) {
-        let cmd_str = format!("source ~/titan_ws/install/setup.bash && ros2 launch titan_bringup {}", file);
+        self.spawn_ros_launch_with_args(file, Vec::new());
+    }
+
+    fn spawn_ros_launch_with_args(&mut self, file: &str, args: Vec<&str>) {
+        let args_str = args.join(" ");
+        let cmd_str = format!("source ~/titan_ws/install/setup.bash && ros2 launch titan_bringup {} {}", file, args_str);
 
         if self.device_type == DeviceType::Laptop {
             self.logs.push(format!("Laptop Mode: {} launching in new window...", file));
@@ -285,11 +367,12 @@ impl App {
             let _ = Command::new("tmux").args(["split-window", "-h", &cmd_str]).spawn();
         } else {
             if self.active_process.is_some() {
-                self.logs.push("Another process is already running!".to_string());
-                return;
+                if let Some(mut child) = self.active_process.take() {
+                    let _ = child.kill();
+                }
             }
+            self.logs.push(format!("Launching: {}...", file));
             let _ = Command::new("bash").arg("-c").arg(&cmd_str).spawn().map(|child| self.active_process = Some(child));
-            self.logs.push(format!("{} launched in background.", file));
         }
     }
 
@@ -582,6 +665,84 @@ async fn run_app<B: ratatui::backend::Backend>(
                 f.render_widget(input, area);
                 f.render_widget(hint, inner_area[2]);
 
+            } else if app.screen == Screen::TeleopConfig {
+                let area = centered_rect(50, 35, size);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" TELEOP CONFIGURATION ")
+                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                
+                let inner = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3), // Speed field
+                        Constraint::Length(3), // Turn field
+                        Constraint::Min(0),    // Hint
+                    ].as_ref())
+                    .margin(2)
+                    .split(area);
+
+                let speed_style = if app.teleop_field_index == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::Gray) };
+                let turn_style = if app.teleop_field_index == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::Gray) };
+
+                let speed_field = Paragraph::new(format!(" Speed: {}_", app.teleop_speed))
+                    .style(speed_style)
+                    .block(Block::default().borders(Borders::ALL).title(" [LINEAR SPEED] "));
+                
+                let turn_field = Paragraph::new(format!(" Turn: {}_", app.teleop_turn))
+                    .style(turn_style)
+                    .block(Block::default().borders(Borders::ALL).title(" [ANGULAR TURN] "));
+
+                let hint = Paragraph::new("Tab/Enter: Switch Field | Esc: Cancel | Enter (on last field): Launch")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray));
+
+                f.render_widget(block, area);
+                f.render_widget(speed_field, inner[0]);
+                f.render_widget(turn_field, inner[1]);
+                f.render_widget(hint, inner[2]);
+
+            } else if app.screen == Screen::MapSelect {
+                let area = centered_rect(40, 50, size);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" SELECT MAP FILE ")
+                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                
+                let items: Vec<ListItem> = app.available_maps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let style = if i == app.map_selection_index {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        ListItem::new(format!(" {} ", m)).style(style)
+                    })
+                    .collect();
+
+                let list = List::new(items)
+                    .block(Block::default().borders(Borders::NONE))
+                    .highlight_symbol(">> ");
+
+                let hint = Paragraph::new("Arrows: Select | Enter: Launch | Esc: Cancel")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray));
+
+                let inner = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(0),
+                        Constraint::Length(1),
+                    ].as_ref())
+                    .margin(2)
+                    .split(area);
+
+                f.render_widget(block, area);
+                f.render_widget(list, inner[0]);
+                f.render_widget(hint, inner[1]);
+
             } else {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -757,6 +918,58 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
                         },
                         _ => {}
+                    }
+                } else if app.screen == Screen::TeleopConfig {
+                    if key.kind == crossterm::event::KeyEventKind::Press {
+                        match key.code {
+                            KeyCode::Esc => app.screen = Screen::Main,
+                            KeyCode::Tab | KeyCode::Down => {
+                                app.teleop_field_index = (app.teleop_field_index + 1) % 2;
+                            },
+                            KeyCode::Up => {
+                                app.teleop_field_index = if app.teleop_field_index == 0 { 1 } else { 0 };
+                            },
+                            KeyCode::Backspace => {
+                                if app.teleop_field_index == 0 { app.teleop_speed.pop(); }
+                                else { app.teleop_turn.pop(); }
+                            },
+                            KeyCode::Delete => {
+                                if app.teleop_field_index == 0 { app.teleop_speed.clear(); }
+                                else { app.teleop_turn.clear(); }
+                            },
+                            KeyCode::Char(c) => {
+                                if c.is_digit(10) || c == '.' || c == '-' {
+                                    if app.teleop_field_index == 0 { app.teleop_speed.push(c); }
+                                    else { app.teleop_turn.push(c); }
+                                }
+                            },
+                            KeyCode::Enter => {
+                                if app.teleop_field_index == 0 {
+                                    app.teleop_field_index = 1;
+                                } else {
+                                    app.execute_selected();
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
+                } else if app.screen == Screen::MapSelect {
+                    if key.kind == crossterm::event::KeyEventKind::Press {
+                        match key.code {
+                            KeyCode::Esc => app.screen = Screen::Main,
+                            KeyCode::Up => {
+                                if app.map_selection_index > 0 { app.map_selection_index -= 1; }
+                            },
+                            KeyCode::Down => {
+                                if app.map_selection_index < app.available_maps.len().saturating_sub(1) {
+                                    app.map_selection_index += 1;
+                                }
+                            },
+                            KeyCode::Enter => {
+                                app.execute_selected();
+                            },
+                            _ => {}
+                        }
                     }
                 } else {
                     match key.code {
