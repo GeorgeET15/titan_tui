@@ -3,6 +3,10 @@ name = "titan_tui"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "trident"
+path = "src/main.rs"
+
 [dependencies]
 ratatui = "0.26"
 crossterm = "0.27"

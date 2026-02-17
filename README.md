@@ -1,31 +1,37 @@
-# TITAN CONTROL SYSTEM v0.1.0 🦀
+# TRIDENT TUI v0.1.0 🔱
 
-The **TITAN Control System** is a high-performance, Text-based User Interface (TUI) for the TITAN robot dashboard, built using **Rust** and the `ratatui` crate.
+**TRIDENT** (**Tactical Remote Interface for Detailed Exploration and Navigation TITAN**) is a high-performance, premium dashboard for the TITAN robot suite. Built with **Rust** and **ROS 2**, it provides a military-grade tactical interface for real-time mission control.
 
 ## ✨ Features
-- **Professional Startup Screen**: Performs a 3-second diagnostic check of Battery, USB components, and ROS context.
-- **Live ROS 2 Telemetry**: Subscribes to `/odom` to display real-time coordinates (X, Y) and Orientation (Yaw).
-- **Intelligent Operations Menu**: Grouped commands for [Robot] operations, [Sys] maintenance, and [Laptop] instructions.
-- **Dynamic Color-Coding**: Visual alerts for hardware status (Green/Yellow/Red) and human-readable power diagnostics.
-- **Smart Tmux Integration**: Automatically splits a vertical pane for long-running ROS processes.
+- **High-Impact Tactical Interface**: A redesigned "Wow-factor" banner and main dashboard with thick borders and vibrant highlights.
+- **Titan Control Center**: Centralized management for [Robot] bringup, [Sys] maintenance, and [Laptop] operator tasks.
+- **Live ROS 2 Telemetry**: Subscribes directly to `/odom` for real-time tracking of Position (X, Y) and Orientation (Theta).
+- **Global Terminal Command**: Launch the full system from anywhere by typing `trident`.
+- **Intelligent Logging**: Real-time status stream with color-coded severity levels (Critical/Stable/Capped).
 
-## 🛠️ Installation
-Ensure you have the Rust toolchain and `libclang-dev` installed:
+## 🛠️ Installation & Setup
+Ensure you have the Rust toolchain and `libclang-dev` installed for ROS 2 bindings.
 
+### 1. Build & Install Globally
+Run this from the project root to enable the `trident` command everywhere:
 ```bash
-cd ~/titan_tui
-cargo build
+cargo install --path .
 ```
 
-## 🚀 Usage
-Launch the dashboard from a `tmux` session for best results:
+### 2. Launch
+The TUI is optimized for `tmux` environments but runs in any modern terminal:
 ```bash
-tmux
-cargo run
+# From any directory:
+trident
 ```
 
 ## 🎮 Interface Controls
 - **Arrows**: Navigate Menu
-- **Enter**: Execute Selected Command
-- **Q**: Quit
-- **C**: Clear Logs
+- **Enter**: Execute Command
+- **Q**: Tactical Exit (Quit)
+- **C**: Clear System Logs
+
+## 🏗️ Technical Stack
+- **Core**: Rust (Safety & Performance)
+- **UI**: `ratatui` (Custom Tactical Frame)
+- **ROS 2**: `r2r` (Native Odometry Integration)

@@ -1,8 +1,9 @@
 use ratatui::{
     backend::CrosstermBackend,
-    widgets::{Block, Borders, Paragraph, List, ListItem},
-    layout::{Layout, Constraint, Direction, Alignment},
+    widgets::{Block, Borders, Paragraph, List, ListItem, Gauge, BorderType},
+    layout::{Layout, Constraint, Direction, Alignment, Rect},
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     Terminal,
 };
 use crossterm::{
@@ -40,7 +41,6 @@ enum MenuItem {
     RemoteTeleop,
     RemoteRViz,
 }
-
 impl MenuItem {
     fn to_string(&self) -> String {
         match self {
@@ -59,21 +59,45 @@ impl MenuItem {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DeviceType {
+    Titan,
+    Laptop,
+    Unselected,
+}
+
+impl DeviceType {
+    fn to_string(&self) -> &str {
+        match self {
+            DeviceType::Titan => "TITAN (Robot)",
+            DeviceType::Laptop => "LAPTOP (Operator)",
+            DeviceType::Unselected => "NOT SELECTED",
+        }
+    }
+}
+
 #[derive(PartialEq)]
 enum Screen {
+    Banner,
     Splash,
+    DeviceSelect,
+    MapNameInput,
     Main,
 }
 
 struct App {
     logs: Vec<String>,
-    menu_items: Vec<MenuItem>,
+    all_menu_items: Vec<MenuItem>,
     active_menu_index: usize,
     active_process: Option<Child>,
     screen: Screen,
     startup_checks: Vec<String>,
     telemetry_rx: watch::Receiver<Telemetry>,
     current_telemetry: Telemetry,
+    splash_start: std::time::Instant,
+    device_type: DeviceType,
+    selection_index: usize,
+    map_name_input: String,
 }
 
 impl App {
@@ -83,7 +107,7 @@ impl App {
                 "TITAN System initialized".to_string(),
                 "Ready for commands".to_string(),
             ],
-            menu_items: vec![
+            all_menu_items: vec![
                 MenuItem::Bringup,
                 MenuItem::LocalTeleop,
                 MenuItem::Mapping,
@@ -98,11 +122,29 @@ impl App {
             ],
             active_menu_index: 0,
             active_process: None,
-            screen: Screen::Splash,
+            screen: Screen::Banner,
             startup_checks: Vec::new(),
             telemetry_rx,
             current_telemetry: Telemetry::default(),
+            splash_start: std::time::Instant::now(),
+            device_type: DeviceType::Unselected,
+            selection_index: 0,
+            map_name_input: String::new(),
         }
+    }
+
+    fn get_filtered_menu(&self) -> Vec<MenuItem> {
+        self.all_menu_items.iter().filter(|item| {
+            match (self.device_type, item) {
+                (DeviceType::Titan, MenuItem::RemoteTeleop) | (DeviceType::Titan, MenuItem::RemoteRViz) => false,
+                (DeviceType::Laptop, MenuItem::Bringup) | (DeviceType::Laptop, MenuItem::LocalTeleop) | 
+                (DeviceType::Laptop, MenuItem::Mapping) | (DeviceType::Laptop, MenuItem::Navigation) |
+                (DeviceType::Laptop, MenuItem::SaveMap) | (DeviceType::Laptop, MenuItem::CheckUSB) |
+                (DeviceType::Laptop, MenuItem::Battery) | (DeviceType::Laptop, MenuItem::Rebuild) |
+                (DeviceType::Laptop, MenuItem::StopProcess) => false,
+                _ => true,
+            }
+        }).cloned().collect()
     }
 
     fn run_diagnostics(&mut self) {
@@ -162,7 +204,9 @@ impl App {
     }
 
     fn execute_selected(&mut self) {
-        let item = self.menu_items[self.active_menu_index].clone();
+        let menu_items = self.get_filtered_menu();
+        if self.active_menu_index >= menu_items.len() { return; }
+        let item = menu_items[self.active_menu_index].clone();
         
         match item {
             MenuItem::Battery => {
@@ -193,21 +237,18 @@ impl App {
                         }
                     },
                     MenuItem::RemoteTeleop => {
-                        self.logs.push("RUN ON LAPTOP:".to_string());
-                        self.logs.push("ros2 run teleop_twist_keyboard teleop_twist_keyboard".to_string());
+                        self.logs.push("Spawning Remote Teleop in new window...".to_string());
+                        let cmd_str = "gnome-terminal -- bash -c 'ros2 run teleop_twist_keyboard teleop_twist_keyboard; exec bash'";
+                        let _ = Command::new("bash").arg("-c").arg(cmd_str).spawn().map(|child| self.active_process = Some(child));
                     },
                     MenuItem::RemoteRViz => {
-                        self.logs.push("RUN ON LAPTOP:".to_string());
-                        self.logs.push("rviz2 -d ~/titan_ws/src/titan_bringup/rviz/titan.rviz".to_string());
+                        self.logs.push("Spawning Remote RViz in new window...".to_string());
+                        let cmd_str = "gnome-terminal -- bash -c 'rviz2 -d ~/titan_ws/src/titan_bringup/rviz/titan.rviz; exec bash'";
+                        let _ = Command::new("bash").arg("-c").arg(cmd_str).spawn().map(|child| self.active_process = Some(child));
                     },
                     MenuItem::SaveMap => {
-                        let output = Command::new("ros2")
-                            .args([
-                                "run", "nav2_map_server", "map_saver_cli", 
-                                "-f", "/home/pidev/titan_ws/src/titan_bringup/maps/campus_map"
-                            ])
-                            .output();
-                        self.handle_output(output, "Map saved.");
+                        self.screen = Screen::MapNameInput;
+                        self.map_name_input.clear();
                     },
                     MenuItem::Rebuild => {
                         self.logs.push("Rebuilding...".to_string());
@@ -229,9 +270,16 @@ impl App {
     }
 
     fn spawn_ros_launch(&mut self, file: &str) {
-        let is_tmux = std::env::var("TMUX").is_ok();
         let cmd_str = format!("source ~/titan_ws/install/setup.bash && ros2 launch titan_bringup {}", file);
 
+        if self.device_type == DeviceType::Laptop {
+            self.logs.push(format!("Laptop Mode: {} launching in new window...", file));
+            let terminal_cmd = format!("gnome-terminal -- bash -c \"{}; exec bash\"", cmd_str);
+            let _ = Command::new("bash").arg("-c").arg(&terminal_cmd).spawn().map(|child| self.active_process = Some(child));
+            return;
+        }
+
+        let is_tmux = std::env::var("TMUX").is_ok();
         if is_tmux {
             self.logs.push("Spawning in tmux split...".to_string());
             let _ = Command::new("tmux").args(["split-window", "-h", &cmd_str]).spawn();
@@ -328,26 +376,111 @@ async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> io::Result<()> {
-    // Run initial diagnostics once
-    app.run_diagnostics();
-    let splash_start = std::time::Instant::now();
-
     loop {
         terminal.draw(|f| {
             let size = f.size();
             
-            if app.screen == Screen::Splash {
+            if app.screen == Screen::Banner {
+                let main_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Thick)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" [ TITAN CONTROL CENTER ] ")
+                    .title_alignment(Alignment::Center);
+                
+                f.render_widget(main_block, size);
+
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length((size.height as i32 - 24).max(0) as u16 / 2),
+                        Constraint::Length(8), // TRIDENT ASCII
+                        Constraint::Length(1), // Subtitle (Backronym)
+                        Constraint::Length(2), // Spacer
+                        Constraint::Length(2), // Description
+                        Constraint::Length(2), // Spacer
+                        Constraint::Length(1), // Version/Build
+                        Constraint::Min(0),    // Hint
+                    ].as_ref())
+                    .split(size);
+
+                let ascii_trident = r#"
+ ████████╗██████╗ ██╗██████╗ ███████╗███╗   ██╗████████╗
+ ╚══██╔══╝██╔══██╗██║██╔══██╗██╔════╝████╗  ██║╚══██╔══╝
+    ██║   ██████╔╝██║██║  ██║█████╗  ██╔██╗ ██║   ██║   
+    ██║   ██╔══██╗██║██║  ██║██╔══╝  ██║╚██╗██║   ██║   
+    ██║   ██║  ██║██║██████╔╝███████╗██║ ╚████║   ██║   
+    ╚═╝   ╚═╝  ╚═╝╚═╝╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝   
+                "#;
+
+                let title = Paragraph::new(ascii_trident)
+                    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                    .alignment(Alignment::Center);
+                
+                let subtitle = Paragraph::new(Line::from(vec![
+                    Span::styled("T", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw("actical "),
+                    Span::styled("R", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw("emote "),
+                    Span::styled("I", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw("nterface for "),
+                    Span::styled("D", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw("etailed "),
+                    Span::styled("E", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw("xploration and "),
+                    Span::styled("N", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw("avigation of "),
+                    Span::styled("T", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw("ITAN"),
+                ])).alignment(Alignment::Center);
+
+                let description_text = vec![
+                    Line::from(vec![
+                        Span::raw("A unified "),
+                        Span::styled("Tactical Interface", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                        Span::raw(" designed for "),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Real-time Telemetry Control", Style::default().fg(Color::Yellow)),
+                        Span::raw(" and "),
+                        Span::styled("Autonomous Mission Flow", Style::default().fg(Color::Yellow)),
+                    ]),
+                ];
+                let description = Paragraph::new(description_text)
+                    .alignment(Alignment::Center);
+
+                let metadata = Paragraph::new(Line::from(vec![
+                    Span::styled("v0.1.0", Style::default().fg(Color::Cyan)),
+                    Span::raw(" | "),
+                    Span::styled("Target: ROS2 Jazzy", Style::default().fg(Color::Green)),
+                    Span::raw(" | "),
+                    Span::styled("Linux", Style::default().fg(Color::White)),
+                ]))
+                .alignment(Alignment::Center);
+
+                let hint = Paragraph::new("\n\nPress [ENTER] to continue | [q] to quit")
+                    .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                    .alignment(Alignment::Center);
+
+                f.render_widget(title, chunks[1]);
+                f.render_widget(subtitle, chunks[2]);
+                f.render_widget(description, chunks[4]); 
+                f.render_widget(metadata, chunks[6]); // Shifted for spacer
+                f.render_widget(hint, chunks[7]);
+
+            } else if app.screen == Screen::Splash {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(3), // Space
                         Constraint::Length(3), // Title
                         Constraint::Min(0),    // Checks
+                        Constraint::Length(3), // Progress Bar
                         Constraint::Length(3), // Status
                     ].as_ref())
                     .split(size);
 
-                let title = Paragraph::new("TITAN CONTROL SYSTEM v0.1.0")
+                let title = Paragraph::new("TRIDENT CONTROL SYSTEM v0.1.0")
                     .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
                     .alignment(Alignment::Center)
                     .block(Block::default().borders(Borders::ALL));
@@ -364,17 +497,91 @@ async fn run_app<B: ratatui::backend::Backend>(
                 let check_list = List::new(checks)
                     .block(Block::default().borders(Borders::ALL).title(" SYSTEM DIAGNOSTICS "));
 
+                let elapsed = app.splash_start.elapsed().as_secs_f32();
+                let progress = (elapsed / 3.0).min(1.0);
+                let gauge = Gauge::default()
+                    .block(Block::default().borders(Borders::ALL).title(" INITIALIZING "))
+                    .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Black).add_modifier(Modifier::ITALIC))
+                    .ratio(progress as f64);
+
                 let status = Paragraph::new("INITIALIZING ROBOT...")
                     .style(Style::default().fg(Color::DarkGray))
                     .alignment(Alignment::Center);
 
                 f.render_widget(title, chunks[1]);
                 f.render_widget(check_list, chunks[2]);
-                f.render_widget(status, chunks[3]);
+                f.render_widget(gauge, chunks[3]);
+                f.render_widget(status, chunks[4]);
 
-                if splash_start.elapsed() > Duration::from_secs(3) {
+                if progress >= 1.0 {
                     app.screen = Screen::Main;
                 }
+            } else if app.screen == Screen::DeviceSelect {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Percentage(30),
+                        Constraint::Length(10),
+                        Constraint::Min(0),
+                    ].as_ref())
+                    .split(size);
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" DEVICE SELECTION ")
+                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+
+                let items = vec![
+                    ListItem::new("  1. TITAN (Robot) - Controller Dashboard "),
+                    ListItem::new("  2. LAPTOP (Remote) - Teleop & Monitoring "),
+                ];
+
+                let list = List::new(items)
+                    .block(block)
+                    .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    .highlight_symbol(">> ");
+
+                let mut state = ratatui::widgets::ListState::default();
+                state.select(Some(app.selection_index));
+
+                // Center the selection box
+                let area = centered_rect(60, 30, size);
+                f.render_stateful_widget(list, area, &mut state);
+
+                let hint = Paragraph::new("Press Up/Down to choose, Enter to confirm | [q] to quit")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray));
+                f.render_widget(hint, chunks[2]);
+
+            } else if app.screen == Screen::MapNameInput {
+                let area = centered_rect(60, 20, size);
+                
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" SAVE MAP AS... ")
+                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+
+                let inner_area = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Min(0),
+                    ].as_ref())
+                    .split(area);
+
+                let input_text = format!(" Name: {}_", app.map_name_input);
+                let input = Paragraph::new(input_text)
+                    .style(Style::default().fg(Color::Yellow))
+                    .block(block);
+
+                let hint = Paragraph::new("Enter: Save  |  Esc: Cancel")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray));
+
+                f.render_widget(input, area);
+                f.render_widget(hint, inner_area[2]);
+
             } else {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -395,13 +602,17 @@ async fn run_app<B: ratatui::backend::Backend>(
                     .split(chunks[1]);
 
                 // 1. Header
-                let header = Paragraph::new(" TITAN CONTROL SYSTEM v0.1.0 ")
+                let header = Paragraph::new(" TRIDENT v0.1.0 ")
                     .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
                     .alignment(Alignment::Center)
-                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .border_style(Style::default().fg(Color::DarkGray)));
                 
                 // 2. Menu
-                let menu_items: Vec<ListItem> = app.menu_items.iter().enumerate()
+                let filtered_menu = app.get_filtered_menu();
+                let menu_items: Vec<ListItem> = filtered_menu.iter().enumerate()
                     .map(|(i, item)| {
                         let style = if i == app.active_menu_index {
                             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD).bg(Color::Rgb(40, 40, 40))
@@ -412,14 +623,34 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }).collect();
                 
                 let menu_list = List::new(menu_items)
-                    .block(Block::default().borders(Borders::ALL).title(" OPERATIONS ").border_style(Style::default().fg(Color::DarkGray)));
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .title(" OPERATIONS ")
+                        .border_style(Style::default().fg(Color::DarkGray)));
 
                 // 3. Telemetry
                 let t = &app.current_telemetry;
-                let odom_text = format!("\n X: {:.3} m\n Y: {:.3} m\n \u{03B8}: {:.3} rad", t.x, t.y, t.theta);
+                let odom_text = vec![
+                    Line::from(vec![
+                        Span::styled(" [POS_X] ", Style::default().fg(Color::Cyan)),
+                        Span::styled(format!("{:.3} m", t.x), Style::default().fg(Color::Yellow)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(" [POS_Y] ", Style::default().fg(Color::Cyan)),
+                        Span::styled(format!("{:.3} m", t.y), Style::default().fg(Color::Yellow)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(" [THETA] ", Style::default().fg(Color::Cyan)),
+                        Span::styled(format!("{:.3} rad", t.theta), Style::default().fg(Color::Yellow)),
+                    ]),
+                ];
                 let odom_panel = Paragraph::new(odom_text)
-                    .style(Style::default().fg(Color::Green))
-                    .block(Block::default().borders(Borders::ALL).title(" TELEMETRY ").border_style(Style::default().fg(Color::DarkGray)));
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .title(" TELEMETRY ")
+                        .border_style(Style::default().fg(Color::DarkGray)));
 
                 // 4. Logs
                 let display_logs = if app.logs.len() > 15 {
@@ -438,13 +669,37 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }).collect();
                 
                 let logs_panel = List::new(logs)
-                    .block(Block::default().borders(Borders::ALL).title(" SYSTEM LOGS ").border_style(Style::default().fg(Color::DarkGray)));
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .title(" SYSTEM LOGS ")
+                        .border_style(Style::default().fg(Color::DarkGray)));
 
                 // 5. Footer
-                let footer = Paragraph::new(" \u{2191}\u{2193}: Select  |  Enter: Execute  |  Q: Quit  |  C: Clear Logs ")
+                let footer_text = Line::from(vec![
+                    Span::styled(" ROLE: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(app.device_type.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(" SELECT  ", Style::default().fg(Color::White)),
+                    Span::styled("|  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("ENTER", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(" EXECUTE  ", Style::default().fg(Color::White)),
+                    Span::styled("|  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Q", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::styled(" QUIT  ", Style::default().fg(Color::White)),
+                    Span::styled("|  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("C", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(" CLEAR LOGS ", Style::default().fg(Color::White)),
+                ]);
+
+                let footer = Paragraph::new(footer_text)
                     .alignment(Alignment::Center)
                     .style(Style::default().fg(Color::DarkGray))
-                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .border_style(Style::default().fg(Color::DarkGray)));
 
                 f.render_widget(header, chunks[0]);
                 f.render_widget(menu_list, body_chunks[0]);
@@ -456,14 +711,62 @@ async fn run_app<B: ratatui::backend::Backend>(
 
         if crossterm::event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if app.screen == Screen::Splash {
-                    app.screen = Screen::Main; // Skip splash on any key
+                if app.screen == Screen::Banner {
+                    match key.code {
+                        KeyCode::Enter => app.screen = Screen::DeviceSelect,
+                        KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
+                        _ => {}
+                    }
+                } else if app.screen == Screen::Splash {
+                    app.screen = Screen::DeviceSelect; // Skip splash on any key
+                } else if app.screen == Screen::DeviceSelect {
+                    match key.code {
+                        KeyCode::Up => if app.selection_index > 0 { app.selection_index -= 1; },
+                        KeyCode::Down => if app.selection_index < 1 { app.selection_index += 1; },
+                        KeyCode::Enter => {
+                            app.device_type = if app.selection_index == 0 { DeviceType::Titan } else { DeviceType::Laptop };
+                            
+                            // Initialize diagnostics and splash after selection
+                            app.startup_checks.clear();
+                            app.run_diagnostics();
+                            app.splash_start = std::time::Instant::now();
+                            app.screen = Screen::Splash;
+                        },
+                        KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
+                        _ => {}
+                    }
+                } else if app.screen == Screen::MapNameInput {
+                    match key.code {
+                        KeyCode::Esc => app.screen = Screen::Main,
+                        KeyCode::Backspace => { app.map_name_input.pop(); },
+                        KeyCode::Char(c) => { app.map_name_input.push(c); },
+                        KeyCode::Enter => {
+                            if !app.map_name_input.trim().is_empty() {
+                                let name = app.map_name_input.trim().to_string();
+                                app.logs.push(format!("Saving map as: {}...", name));
+                                
+                                let path = format!("/home/pidev/titan_ws/src/titan_bringup/maps/{}", name);
+                                let output = Command::new("ros2")
+                                    .args([
+                                        "run", "nav2_map_server", "map_saver_cli", 
+                                        "-f", &path
+                                    ])
+                                    .output();
+                                app.handle_output(output, &format!("Map '{}' saved.", name));
+                                app.screen = Screen::Main;
+                            }
+                        },
+                        _ => {}
+                    }
                 } else {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
                         KeyCode::Char('c') | KeyCode::Char('C') => app.logs.clear(),
                         KeyCode::Up => if app.active_menu_index > 0 { app.active_menu_index -= 1; },
-                        KeyCode::Down => if app.active_menu_index < app.menu_items.len() - 1 { app.active_menu_index += 1; },
+                        KeyCode::Down => {
+                            let max = app.get_filtered_menu().len().saturating_sub(1);
+                            if app.active_menu_index < max { app.active_menu_index += 1; }
+                        },
                         KeyCode::Enter => app.execute_selected(),
                         _ => {}
                     }
@@ -474,3 +777,22 @@ async fn run_app<B: ratatui::backend::Backend>(
     }
 }
 
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ].as_ref())
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ].as_ref())
+        .split(popup_layout[1])[1]
+}
