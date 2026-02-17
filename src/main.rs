@@ -12,8 +12,18 @@ use crossterm::{
 };
 use anyhow::Result;
 use std::{io, time::Duration, process::{Command, Child}};
+use futures::StreamExt;
+use r2r::nav_msgs::msg::Odometry;
+use tokio::sync::watch;
 
-#[derive(PartialEq, Clone)]
+#[derive(Clone, Default)]
+struct Telemetry {
+    x: f64,
+    y: f64,
+    theta: f64,
+}
+
+#[derive(Clone)]
 enum MenuItem {
     // Robot Local
     Bringup,
@@ -34,17 +44,17 @@ enum MenuItem {
 impl MenuItem {
     fn to_string(&self) -> String {
         match self {
-            MenuItem::Bringup => "[Robot] Bringup (Drivers)".to_string(),
-            MenuItem::LocalTeleop => "[Robot] Local Teleop (Split)".to_string(),
-            MenuItem::Mapping => "[Robot] Mapping (SLAM)".to_string(),
-            MenuItem::Navigation => "[Robot] Navigation (Auto)".to_string(),
-            MenuItem::SaveMap => "[Robot] Save Current Map".to_string(),
-            MenuItem::CheckUSB => "[Sys]   Check USB/Serial".to_string(),
-            MenuItem::Battery => "[Sys]   Power/Battery".to_string(),
-            MenuItem::Rebuild => "[Sys]   Rebuild Workspace".to_string(),
-            MenuItem::StopProcess => "[Sys]   Stop Background Proc".to_string(),
-            MenuItem::RemoteTeleop => "[Laptop] Remote Teleop Cmd".to_string(),
-            MenuItem::RemoteRViz => "[Laptop] Remote RViz Cmd".to_string(),
+            MenuItem::Bringup => "[Robot] START BRINGUP".to_string(),
+            MenuItem::LocalTeleop => "[Robot] LOCAL TELEOP (TMUX)".to_string(),
+            MenuItem::Mapping => "[Robot] START MAPPING".to_string(),
+            MenuItem::Navigation => "[Robot] START NAV2".to_string(),
+            MenuItem::SaveMap => "[Robot] SAVE MAP".to_string(),
+            MenuItem::CheckUSB => "[Sys] CHECK USB/SERIAL".to_string(),
+            MenuItem::Battery => "[Sys] POWER/BATTERY".to_string(),
+            MenuItem::Rebuild => "[Sys] REBUILD WORKSPACE".to_string(),
+            MenuItem::StopProcess => "[Sys] STOP BACKGROUND PROC".to_string(),
+            MenuItem::RemoteTeleop => "[Laptop] REMOTE TELEOP".to_string(),
+            MenuItem::RemoteRViz => "[Laptop] REMOTE RVIZ".to_string(),
         }
     }
 }
@@ -56,23 +66,19 @@ enum Screen {
 }
 
 struct App {
-    x: f64,
-    y: f64,
-    theta: f64,
     logs: Vec<String>,
     menu_items: Vec<MenuItem>,
     active_menu_index: usize,
     active_process: Option<Child>,
     screen: Screen,
     startup_checks: Vec<String>,
+    telemetry_rx: watch::Receiver<Telemetry>,
+    current_telemetry: Telemetry,
 }
 
 impl App {
-    fn new() -> App {
+    fn new(telemetry_rx: watch::Receiver<Telemetry>) -> App {
         App {
-            x: 0.0,
-            y: 0.0,
-            theta: 0.0,
             logs: vec![
                 "TITAN System initialized".to_string(),
                 "Ready for commands".to_string(),
@@ -94,6 +100,8 @@ impl App {
             active_process: None,
             screen: Screen::Splash,
             startup_checks: Vec::new(),
+            telemetry_rx,
+            current_telemetry: Telemetry::default(),
         }
     }
 
@@ -107,7 +115,7 @@ impl App {
             self.startup_checks.push(format!("  -> {}", line));
         }
         
-        self.startup_checks.push("Sourcing Workspace... OK".to_string());
+        self.startup_checks.push("ROS 2 Context... OK".to_string());
         self.startup_checks.push("Starting TITAN Control System...".to_string());
     }
 
@@ -146,7 +154,12 @@ impl App {
         results
     }
 
-    fn on_tick(&mut self) {}
+    fn on_tick(&mut self) {
+        if self.telemetry_rx.has_changed().unwrap_or(false) {
+            let data = self.telemetry_rx.borrow_and_update();
+            self.current_telemetry = data.clone();
+        }
+    }
 
     fn execute_selected(&mut self) {
         let item = self.menu_items[self.active_menu_index].clone();
@@ -258,13 +271,49 @@ impl App {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ROS 2 Initialization
+    let ctx = r2r::Context::create().expect("Failed to create ROS 2 context");
+    let mut node = r2r::Node::create(ctx, "titan_tui", "").expect("Failed to create ROS 2 node");
+    
+    let (tx, rx) = watch::channel(Telemetry::default());
+    
+    // Subscribe to Odometry
+    let mut sub = node.subscribe::<Odometry>("/odom", r2r::QosProfile::default()).expect("Failed to subscribe to /odom");
+    
+    // Background ROS task (handles sub and spin in one loop)
+    tokio::spawn(async move {
+        loop {
+            // Process ROS callbacks
+            node.spin_once(std::time::Duration::from_millis(10));
+            
+            // Non-blocking check for new messages
+            // r2r's next() is async, so we use a very short timeout or just a small sleep
+            match tokio::time::timeout(std::time::Duration::from_millis(5), sub.next()).await {
+                Ok(Some(msg)) => {
+                    let x = msg.pose.pose.position.x;
+                    let y = msg.pose.pose.position.y;
+                    
+                    let q = msg.pose.pose.orientation;
+                    let siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+                    let cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+                    let theta = f64::atan2(siny_cosp, cosy_cosp);
+
+                    let _ = tx.send(Telemetry { x, y, theta });
+                }
+                _ => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+
+    // TUI Initialization
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::new(rx);
     let res = run_app(&mut terminal, &mut app).await;
 
     disable_raw_mode()?;
@@ -366,7 +415,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                     .block(Block::default().borders(Borders::ALL).title(" OPERATIONS ").border_style(Style::default().fg(Color::DarkGray)));
 
                 // 3. Telemetry
-                let odom_text = format!("\n X: {:.3} m\n Y: {:.3} m\n \u{03B8}: {:.3} rad", app.x, app.y, app.theta);
+                let t = &app.current_telemetry;
+                let odom_text = format!("\n X: {:.3} m\n Y: {:.3} m\n \u{03B8}: {:.3} rad", t.x, t.y, t.theta);
                 let odom_panel = Paragraph::new(odom_text)
                     .style(Style::default().fg(Color::Green))
                     .block(Block::default().borders(Borders::ALL).title(" TELEMETRY ").border_style(Style::default().fg(Color::DarkGray)));
