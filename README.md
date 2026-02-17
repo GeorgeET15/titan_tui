@@ -1,6 +1,6 @@
-# TRIDENT TITAN v0.1.0 🔱
+# TRIDENT v0.1.0 🔱
 
-**TRIDENT** (**Tactical Remote Interface for Detailed Exploration and Navigation TITAN**) is a high-performance, premium cockpit for the TITAN robot suite. Built with **Rust** and **ROS 2**, it provides a military-grade tactical interface for real-time mission control and autonomous navigation management.
+**TRIDENT** (**Tactical Remote Interface for Detailed Exploration and Navigation of TITAN**) is a high-performance, premium cockpit for the TITAN robot suite. Built with **Rust** and **ROS 2**, it provides a military-grade tactical interface for real-time mission control and autonomous navigation management.
 
 ## ✨ Features
 - **Dynamic Teleop Configuration**: Tune linear speed and angular turn profiles on the fly via a sleek modal dialog before launching control nodes.
