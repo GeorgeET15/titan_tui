@@ -217,7 +217,8 @@ impl App {
 
     fn update_maps_list(&mut self) {
         self.available_maps.clear();
-        let maps_path = "/home/pidev/titan_ws/src/titan_bringup/maps/";
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pidev".to_string());
+        let maps_path = format!("{}/titan_ws/src/titan_bringup/maps/", home);
         if let Ok(entries) = std::fs::read_dir(maps_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -234,7 +235,8 @@ impl App {
 
     fn update_rviz_configs_list(&mut self) {
         self.available_rviz_configs.clear();
-        let config_path = "/home/pidev/titan_ws/src/titan_bringup/rviz_config/";
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pidev".to_string());
+        let config_path = format!("{}/titan_ws/src/titan_bringup/rviz_config/", home);
         if let Ok(entries) = std::fs::read_dir(config_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -321,7 +323,8 @@ impl App {
                             self.logs.push("Error: No maps available. Please run mapping first!".to_string());
                             return;
                         }
-                        let maps_path = "/home/pidev/titan_ws/src/titan_bringup/maps/";
+                        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pidev".to_string());
+                        let maps_path = format!("{}/titan_ws/src/titan_bringup/maps/", home);
                         let map_file = format!("{}{}", maps_path, self.available_maps[self.map_selection_index]);
                         let map_arg = format!("map:={}", map_file);
                         self.spawn_ros_launch_with_args("navigation.launch.py", vec![&map_arg]);
@@ -367,7 +370,9 @@ impl App {
                     },
                     MenuItem::Rebuild => {
                         self.logs.push("Rebuilding...".to_string());
-                        let output = Command::new("bash").arg("-c").arg("cd ~/titan_ws && colcon build --symlink-install").output();
+                        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pidev".to_string());
+                        let build_cmd = format!("cd {}/titan_ws && colcon build --symlink-install", home);
+                        let output = Command::new("bash").arg("-c").arg(build_cmd).output();
                         self.handle_output(output, "Rebuild complete.");
                     },
                     MenuItem::StopProcess => {
