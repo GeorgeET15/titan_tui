@@ -84,6 +84,7 @@ enum Screen {
     MapNameInput,
     TeleopConfig,
     MapSelect,
+    RVizConfigSelect,
     Main,
 }
 
@@ -106,6 +107,8 @@ struct App {
     pending_teleop_item: Option<MenuItem>,
     available_maps: Vec<String>,
     map_selection_index: usize,
+    available_rviz_configs: Vec<String>,
+    rviz_config_selection_index: usize,
 }
 
 impl App {
@@ -144,6 +147,8 @@ impl App {
             pending_teleop_item: None,
             available_maps: Vec::new(),
             map_selection_index: 0,
+            available_rviz_configs: Vec::new(),
+            rviz_config_selection_index: 0,
         }
     }
 
@@ -227,6 +232,23 @@ impl App {
         self.map_selection_index = 0;
     }
 
+    fn update_rviz_configs_list(&mut self) {
+        self.available_rviz_configs.clear();
+        let config_path = "/home/pidev/titan_ws/src/titan_bringup/rviz_config/";
+        if let Ok(entries) = std::fs::read_dir(config_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("rviz") {
+                    if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
+                        self.available_rviz_configs.push(file_name.to_string());
+                    }
+                }
+            }
+        }
+        self.available_rviz_configs.sort();
+        self.rviz_config_selection_index = 0;
+    }
+
     fn on_tick(&mut self) {
         if self.telemetry_rx.has_changed().unwrap_or(false) {
             let data = self.telemetry_rx.borrow_and_update();
@@ -276,7 +298,17 @@ impl App {
                     return;
                 }
 
-                if self.screen == Screen::MapSelect {
+                if self.screen != Screen::RVizConfigSelect && item == MenuItem::RemoteRViz {
+                    self.update_rviz_configs_list();
+                    if self.available_rviz_configs.is_empty() {
+                        self.logs.push("Error: No RViz configs found in 'rviz_config/'!".to_string());
+                        return;
+                    }
+                    self.screen = Screen::RVizConfigSelect;
+                    return;
+                }
+
+                if self.screen == Screen::MapSelect || self.screen == Screen::RVizConfigSelect {
                     self.screen = Screen::Main;
                 }
 
@@ -285,11 +317,12 @@ impl App {
                     MenuItem::Bringup => self.spawn_ros_launch("bringup.launch.py"),
                     MenuItem::Mapping => self.spawn_ros_launch("mapping.launch.py"),
                     MenuItem::Navigation => {
-                        let map_file = if self.available_maps.is_empty() {
-                            "map.yaml".to_string()
-                        } else {
-                            self.available_maps[self.map_selection_index].clone()
-                        };
+                        if self.available_maps.is_empty() {
+                            self.logs.push("Error: No maps available. Please run mapping first!".to_string());
+                            return;
+                        }
+                        let maps_path = "/home/pidev/titan_ws/src/titan_bringup/maps/";
+                        let map_file = format!("{}{}", maps_path, self.available_maps[self.map_selection_index]);
                         let map_arg = format!("map:={}", map_file);
                         self.spawn_ros_launch_with_args("navigation.launch.py", vec![&map_arg]);
                     },
@@ -319,8 +352,13 @@ impl App {
                         let _ = Command::new("bash").arg("-c").arg(cmd_str).spawn().map(|child| self.active_process = Some(child));
                     },
                     MenuItem::RemoteRViz => {
-                        self.logs.push("Spawning Remote RViz in new window...".to_string());
-                        let cmd_str = "gnome-terminal -- bash -c 'rviz2 -d ~/titan_ws/src/titan_bringup/rviz/titan.rviz; exec bash'";
+                        let config_file = if self.available_rviz_configs.is_empty() {
+                            "titan.rviz".to_string()
+                        } else {
+                            self.available_rviz_configs[self.rviz_config_selection_index].clone()
+                        };
+                        self.logs.push(format!("Spawning Remote RViz with config: {}...", config_file));
+                        let cmd_str = format!("gnome-terminal -- bash -c 'rviz2 -d ~/titan_ws/src/titan_bringup/rviz_config/{}; exec bash'", config_file);
                         let _ = Command::new("bash").arg("-c").arg(cmd_str).spawn().map(|child| self.active_process = Some(child));
                     },
                     MenuItem::SaveMap => {
@@ -743,6 +781,47 @@ async fn run_app<B: ratatui::backend::Backend>(
                 f.render_widget(list, inner[0]);
                 f.render_widget(hint, inner[1]);
 
+            } else if app.screen == Screen::RVizConfigSelect {
+                let area = centered_rect(40, 50, size);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" SELECT RVIZ CONFIG ")
+                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                
+                let items: Vec<ListItem> = app.available_rviz_configs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let style = if i == app.rviz_config_selection_index {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        ListItem::new(format!(" {} ", m)).style(style)
+                    })
+                    .collect();
+
+                let list = List::new(items)
+                    .block(Block::default().borders(Borders::NONE))
+                    .highlight_symbol(">> ");
+
+                let hint = Paragraph::new("Arrows: Select | Enter: Launch | Esc: Cancel")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray));
+
+                let inner = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(0),
+                        Constraint::Length(1),
+                    ].as_ref())
+                    .margin(2)
+                    .split(area);
+
+                f.render_widget(block, area);
+                f.render_widget(list, inner[0]);
+                f.render_widget(hint, inner[1]);
+
             } else {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -963,6 +1042,24 @@ async fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Down => {
                                 if app.map_selection_index < app.available_maps.len().saturating_sub(1) {
                                     app.map_selection_index += 1;
+                                }
+                            },
+                            KeyCode::Enter => {
+                                app.execute_selected();
+                            },
+                            _ => {}
+                        }
+                    }
+                } else if app.screen == Screen::RVizConfigSelect {
+                    if key.kind == crossterm::event::KeyEventKind::Press {
+                        match key.code {
+                            KeyCode::Esc => app.screen = Screen::Main,
+                            KeyCode::Up => {
+                                if app.rviz_config_selection_index > 0 { app.rviz_config_selection_index -= 1; }
+                            },
+                            KeyCode::Down => {
+                                if app.rviz_config_selection_index < app.available_rviz_configs.len().saturating_sub(1) {
+                                    app.rviz_config_selection_index += 1;
                                 }
                             },
                             KeyCode::Enter => {
