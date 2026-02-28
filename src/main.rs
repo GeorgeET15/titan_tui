@@ -109,6 +109,9 @@ struct App {
     map_selection_index: usize,
     available_rviz_configs: Vec<String>,
     rviz_config_selection_index: usize,
+    operation_status: String,
+    spinner_frame: usize,
+    last_tick: std::time::Instant,
 }
 
 impl App {
@@ -149,6 +152,9 @@ impl App {
             map_selection_index: 0,
             available_rviz_configs: Vec::new(),
             rviz_config_selection_index: 0,
+            operation_status: "IDLE".to_string(),
+            spinner_frame: 0,
+            last_tick: std::time::Instant::now(),
         }
     }
 
@@ -256,6 +262,41 @@ impl App {
             let data = self.telemetry_rx.borrow_and_update();
             self.current_telemetry = data.clone();
         }
+
+        // Update spinner frame roughly every 100ms
+        if self.last_tick.elapsed() >= Duration::from_millis(100) {
+            self.spinner_frame = (self.spinner_frame + 1) % 8;
+            self.last_tick = std::time::Instant::now();
+        }
+
+        // Check if active process is still running
+        if let Some(ref mut child) = self.active_process {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.logs.push(format!("Process finished with status: {}", status));
+                    self.active_process = None;
+                    self.operation_status = "IDLE".to_string();
+                },
+                Ok(None) => {
+                    // Still running
+                },
+                Err(e) => {
+                    self.logs.push(format!("Error checking process: {}", e));
+                    self.active_process = None;
+                    self.operation_status = "IDLE".to_string();
+                }
+            }
+        }
+    }
+
+    fn translate_log(&self, msg: &str) -> String {
+        if msg.contains("bringup.launch.py") { "Initializing Hardware Drivers...".to_string() }
+        else if msg.contains("mapping.launch.py") { "Starting SLAM (Mapping) Session...".to_string() }
+        else if msg.contains("navigation.launch.py") { "Activating Nav2 Stack...".to_string() }
+        else if msg.contains("teleop_twist_keyboard") { "Opening Teleop Terminal...".to_string() }
+        else if msg.contains("map_saver_cli") { "Compressing & Saving Map Data...".to_string() }
+        else if msg.contains("colcon build") { "Compiling Workspace Packages...".to_string() }
+        else { msg.to_string() }
     }
 
     fn execute_selected(&mut self) {
@@ -314,15 +355,22 @@ impl App {
                     self.screen = Screen::Main;
                 }
 
-                self.logs.push(format!("Executing: {}", item.to_string()));
+                self.logs.push(self.translate_log(&format!("Executing: {}", item.to_string())));
                 match item {
-                    MenuItem::Bringup => self.spawn_ros_launch("bringup.launch.py"),
-                    MenuItem::Mapping => self.spawn_ros_launch("mapping.launch.py"),
+                    MenuItem::Bringup => {
+                        self.operation_status = "BRINGUP".to_string();
+                        self.spawn_ros_launch("bringup.launch.py");
+                    },
+                    MenuItem::Mapping => {
+                        self.operation_status = "MAPPING".to_string();
+                        self.spawn_ros_launch("mapping.launch.py");
+                    },
                     MenuItem::Navigation => {
                         if self.available_maps.is_empty() {
                             self.logs.push("Error: No maps available. Please run mapping first!".to_string());
                             return;
                         }
+                        self.operation_status = "NAVIGATION".to_string();
                         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pidev".to_string());
                         let maps_path = format!("{}/titan_ws/src/titan_bringup/maps/", home);
                         let map_file = format!("{}{}", maps_path, self.available_maps[self.map_selection_index]);
@@ -414,7 +462,7 @@ impl App {
                     let _ = child.kill();
                 }
             }
-            self.logs.push(format!("Launching: {}...", file));
+            self.logs.push(self.translate_log(&format!("Launching: {}...", file)));
             let _ = Command::new("bash").arg("-c").arg(&cmd_str).spawn().map(|child| self.active_process = Some(child));
         }
     }
@@ -423,7 +471,7 @@ impl App {
         match res {
             Ok(out) => {
                 if out.status.success() {
-                    self.logs.push(success_msg.to_string());
+                    self.logs.push(self.translate_log(success_msg));
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     let lines: Vec<&str> = stdout.lines()
                         .filter(|l| !l.trim().is_empty() && !l.contains("total 0"))
@@ -846,14 +894,34 @@ async fn run_app<B: ratatui::backend::Backend>(
                     ].as_ref())
                     .split(chunks[1]);
 
-                // 1. Header
-                let header = Paragraph::new(" TRIDENT v0.1.0 ")
-                    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                // 1. Header with dynamic status
+                let spinner = if app.active_process.is_some() {
+                    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+                    frames[app.spinner_frame]
+                } else {
+                    " "
+                };
+
+                let status_color = match app.operation_status.as_str() {
+                    "MAPPING" => Color::Magenta,
+                    "NAVIGATION" => Color::Green,
+                    "BRINGUP" => Color::Blue,
+                    _ => Color::DarkGray,
+                };
+
+                let header_text = vec![
+                    Span::styled(format!(" {}  ", spinner), Style::default().fg(Color::Cyan)),
+                    Span::styled("TRIDENT v0.2.0 ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" [ {} ] ", app.operation_status), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {} ", spinner), Style::default().fg(Color::Cyan)),
+                ];
+
+                let header = Paragraph::new(Line::from(header_text))
                     .alignment(Alignment::Center)
                     .block(Block::default()
                         .borders(Borders::ALL)
-                        .border_type(BorderType::Plain)
-                        .border_style(Style::default().fg(Color::DarkGray)));
+                        .border_type(BorderType::Thick)
+                        .border_style(Style::default().fg(Color::Cyan)));
                 
                 // 2. Menu
                 let filtered_menu = app.get_filtered_menu();
