@@ -37,6 +37,7 @@ enum MenuItem {
     CheckUSB,
     Battery,
     Rebuild,
+    ConnectWiFi,
     KillAll,
     // Laptop Remote (Instructions)
     RemoteTeleop,
@@ -54,6 +55,7 @@ impl MenuItem {
             MenuItem::CheckUSB => "[Sys] CHECK USB/SERIAL".to_string(),
             MenuItem::Battery => "[Sys] POWER/BATTERY".to_string(),
             MenuItem::Rebuild => "[Sys] REBUILD WORKSPACE".to_string(),
+            MenuItem::ConnectWiFi => "[Sys] CONNECT WIFI (USB)".to_string(),
             MenuItem::KillAll => "[Sys] KILL ALL ROS2 PROC".to_string(),
             MenuItem::RemoteTeleop => "[Laptop] REMOTE TELEOP".to_string(),
             MenuItem::RemoteRViz => "[Laptop] REMOTE RVIZ".to_string(),
@@ -87,6 +89,8 @@ enum Screen {
     TeleopConfig,
     MapSelect,
     RVizConfigSelect,
+    WifiScan,
+    WifiPasswordInput,
     Main,
 }
 
@@ -114,6 +118,11 @@ struct App {
     operation_status: String,
     spinner_frame: usize,
     last_tick: std::time::Instant,
+    // WiFi Management
+    available_ssids: Vec<String>,
+    wifi_selection_index: usize,
+    selected_ssid: String,
+    wifi_password_input: String,
 }
 
 impl App {
@@ -133,6 +142,7 @@ impl App {
                 MenuItem::CheckUSB,
                 MenuItem::Battery,
                 MenuItem::Rebuild,
+                MenuItem::ConnectWiFi,
                 MenuItem::KillAll,
                 MenuItem::RemoteTeleop,
                 MenuItem::RemoteRViz,
@@ -158,6 +168,10 @@ impl App {
             operation_status: "IDLE".to_string(),
             spinner_frame: 0,
             last_tick: std::time::Instant::now(),
+            available_ssids: Vec::new(),
+            wifi_selection_index: 0,
+            selected_ssid: String::new(),
+            wifi_password_input: String::new(),
         }
     }
 
@@ -169,7 +183,7 @@ impl App {
                 (DeviceType::Laptop, MenuItem::Mapping) | (DeviceType::Laptop, MenuItem::Cartographer) | (DeviceType::Laptop, MenuItem::Navigation) |
                 (DeviceType::Laptop, MenuItem::SaveMap) | (DeviceType::Laptop, MenuItem::CheckUSB) |
                 (DeviceType::Laptop, MenuItem::Battery) | (DeviceType::Laptop, MenuItem::Rebuild) |
-                (DeviceType::Laptop, MenuItem::KillAll) => false,
+                (DeviceType::Laptop, MenuItem::ConnectWiFi) | (DeviceType::Laptop, MenuItem::KillAll) => false,
                 _ => true,
             }
         }).cloned().collect()
@@ -258,6 +272,57 @@ impl App {
         }
         self.available_rviz_configs.sort();
         self.rviz_config_selection_index = 0;
+    }
+
+    fn update_wifi_list(&mut self) {
+        self.logs.push("Scanning for WiFi networks (USB Adapter)...".to_string());
+        let output = Command::new("nmcli")
+            .args(["-t", "-f", "SSID", "dev", "wifi", "list", "ifname", "wlxd03745f25a51"])
+            .output();
+
+        if let Ok(out) = output {
+            let s = String::from_utf8_lossy(&out.stdout);
+            let mut ssids: Vec<String> = s.lines()
+                .filter(|line| !line.is_empty() && *line != "--")
+                .map(|line| line.to_string())
+                .collect();
+            
+            ssids.sort();
+            ssids.dedup();
+            self.available_ssids = ssids;
+            
+            if self.available_ssids.is_empty() {
+                self.logs.push("No WiFi networks found.".to_string());
+            } else {
+                self.logs.push(format!("Found {} networks.", self.available_ssids.len()));
+            }
+        } else {
+            self.logs.push("Error: Failed to scan for WiFi.".to_string());
+        }
+    }
+
+    fn perform_wifi_connection(&mut self) {
+        let ssid = self.selected_ssid.clone();
+        let pass = self.wifi_password_input.clone();
+        self.logs.push(format!("Connecting to {}...", ssid));
+        
+        let cmd = format!("echo \"pi@bin\" | sudo -S nmcli device wifi connect \"{}\" password \"{}\" ifname wlxd03745f25a51", ssid, pass);
+        let output = Command::new("bash").arg("-c").arg(cmd).output();
+        
+        match output {
+            Ok(out) => {
+                if out.status.success() {
+                    self.logs.push(format!("Successfully connected to {}!", ssid));
+                    self.operation_status = "IDLE".to_string();
+                } else {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    self.logs.push(format!("Connection failed: {}", err));
+                }
+            },
+            Err(e) => self.logs.push(format!("Execution error: {}", e)),
+        }
+        self.screen = Screen::Main;
+        self.wifi_password_input.clear();
     }
 
     fn on_tick(&mut self) {
@@ -424,6 +489,13 @@ impl App {
                     MenuItem::SaveMap => {
                         self.screen = Screen::MapNameInput;
                         self.map_name_input.clear();
+                    },
+                    MenuItem::ConnectWiFi => {
+                        self.update_wifi_list();
+                        if !self.available_ssids.is_empty() {
+                            self.screen = Screen::WifiScan;
+                            self.wifi_selection_index = 0;
+                        }
                     },
                     MenuItem::Rebuild => {
                         self.logs.push("Rebuilding...".to_string());
@@ -884,6 +956,76 @@ async fn run_app<B: ratatui::backend::Backend>(
                 f.render_widget(list, inner[0]);
                 f.render_widget(hint, inner[1]);
 
+            } else if app.screen == Screen::WifiScan {
+                let area = centered_rect(50, 60, size);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" SELECT WIFI NETWORK (USB) ")
+                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                
+                let items: Vec<ListItem> = app.available_ssids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let style = if i == app.wifi_selection_index {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        ListItem::new(format!(" {} ", s)).style(style)
+                    })
+                    .collect();
+
+                let list = List::new(items)
+                    .block(Block::default().borders(Borders::NONE))
+                    .highlight_symbol(">> ");
+
+                let hint = Paragraph::new("Arrows: Select | Enter: Password | Esc: Cancel")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray));
+
+                let inner = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(0),
+                        Constraint::Length(1),
+                    ].as_ref())
+                    .margin(2)
+                    .split(area);
+
+                f.render_widget(block, area);
+                f.render_widget(list, inner[0]);
+                f.render_widget(hint, inner[1]);
+
+            } else if app.screen == Screen::WifiPasswordInput {
+                let area = centered_rect(60, 20, size);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" PASSWORD FOR [{}] ", app.selected_ssid))
+                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+
+                let asterisks: String = "*".repeat(app.wifi_password_input.len());
+                let input_text = format!(" Password: {}_", asterisks);
+                let input = Paragraph::new(input_text)
+                    .style(Style::default().fg(Color::Yellow))
+                    .block(block);
+
+                let hint = Paragraph::new("Enter: Connect  |  Esc: Cancel")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray));
+
+                let inner = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Min(0),
+                    ].as_ref())
+                    .split(area);
+
+                f.render_widget(input, area);
+                f.render_widget(hint, inner[2]);
+
             } else {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -1146,6 +1288,38 @@ async fn run_app<B: ratatui::backend::Backend>(
                             },
                             KeyCode::Enter => {
                                 app.execute_selected();
+                            },
+                            _ => {}
+                        }
+                    }
+                } else if app.screen == Screen::WifiScan {
+                    if key.kind == crossterm::event::KeyEventKind::Press {
+                        match key.code {
+                            KeyCode::Esc => app.screen = Screen::Main,
+                            KeyCode::Up => {
+                                if app.wifi_selection_index > 0 { app.wifi_selection_index -= 1; }
+                            },
+                            KeyCode::Down => {
+                                if app.wifi_selection_index < app.available_ssids.len().saturating_sub(1) {
+                                    app.wifi_selection_index += 1;
+                                }
+                            },
+                            KeyCode::Enter => {
+                                app.selected_ssid = app.available_ssids[app.wifi_selection_index].clone();
+                                app.wifi_password_input.clear();
+                                app.screen = Screen::WifiPasswordInput;
+                            },
+                            _ => {}
+                        }
+                    }
+                } else if app.screen == Screen::WifiPasswordInput {
+                    if key.kind == crossterm::event::KeyEventKind::Press {
+                        match key.code {
+                            KeyCode::Esc => app.screen = Screen::Main,
+                            KeyCode::Backspace => { app.wifi_password_input.pop(); },
+                            KeyCode::Char(c) => { app.wifi_password_input.push(c); },
+                            KeyCode::Enter => {
+                                app.perform_wifi_connection();
                             },
                             _ => {}
                         }
