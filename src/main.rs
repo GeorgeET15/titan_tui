@@ -37,12 +37,10 @@ enum MenuItem {
     CheckUSB,
     Battery,
     Rebuild,
-    StopProcess,
     KillAll,
     // Laptop Remote (Instructions)
     RemoteTeleop,
     RemoteRViz,
-    SafeRViz,
 }
 impl MenuItem {
     fn to_string(&self) -> String {
@@ -56,11 +54,9 @@ impl MenuItem {
             MenuItem::CheckUSB => "[Sys] CHECK USB/SERIAL".to_string(),
             MenuItem::Battery => "[Sys] POWER/BATTERY".to_string(),
             MenuItem::Rebuild => "[Sys] REBUILD WORKSPACE".to_string(),
-            MenuItem::StopProcess => "[Sys] STOP BACKGROUND PROC".to_string(),
             MenuItem::KillAll => "[Sys] KILL ALL ROS2 PROC".to_string(),
             MenuItem::RemoteTeleop => "[Laptop] REMOTE TELEOP".to_string(),
             MenuItem::RemoteRViz => "[Laptop] REMOTE RVIZ".to_string(),
-            MenuItem::SafeRViz => "[Laptop] REMOTE RVIZ (SAFE MODE)".to_string(),
         }
     }
 }
@@ -137,11 +133,9 @@ impl App {
                 MenuItem::CheckUSB,
                 MenuItem::Battery,
                 MenuItem::Rebuild,
-                MenuItem::StopProcess,
                 MenuItem::KillAll,
                 MenuItem::RemoteTeleop,
                 MenuItem::RemoteRViz,
-                MenuItem::SafeRViz,
             ],
             active_menu_index: 0,
             active_process: None,
@@ -170,12 +164,12 @@ impl App {
     fn get_filtered_menu(&self) -> Vec<MenuItem> {
         self.all_menu_items.iter().filter(|item| {
             match (self.device_type, item) {
-                (DeviceType::Titan, MenuItem::RemoteTeleop) | (DeviceType::Titan, MenuItem::RemoteRViz) | (DeviceType::Titan, MenuItem::SafeRViz) => false,
+                (DeviceType::Titan, MenuItem::RemoteTeleop) | (DeviceType::Titan, MenuItem::RemoteRViz) => false,
                 (DeviceType::Laptop, MenuItem::Bringup) | (DeviceType::Laptop, MenuItem::LocalTeleop) | 
                 (DeviceType::Laptop, MenuItem::Mapping) | (DeviceType::Laptop, MenuItem::Cartographer) | (DeviceType::Laptop, MenuItem::Navigation) |
                 (DeviceType::Laptop, MenuItem::SaveMap) | (DeviceType::Laptop, MenuItem::CheckUSB) |
                 (DeviceType::Laptop, MenuItem::Battery) | (DeviceType::Laptop, MenuItem::Rebuild) |
-                (DeviceType::Laptop, MenuItem::StopProcess) | (DeviceType::Laptop, MenuItem::KillAll) => false,
+                (DeviceType::Laptop, MenuItem::KillAll) => false,
                 _ => true,
             }
         }).cloned().collect()
@@ -424,16 +418,6 @@ impl App {
                             self.available_rviz_configs[self.rviz_config_selection_index].clone()
                         };
                         self.logs.push(format!("Spawning Remote RViz with config: {}...", config_file));
-                        let cmd_str = format!("gnome-terminal -- bash -c 'rviz2 -d ~/titan_ws/src/titan_bringup/rviz_config/{}; exec bash'", config_file);
-                        let _ = Command::new("bash").arg("-c").arg(cmd_str).spawn().map(|child| self.active_process = Some(child));
-                    },
-                    MenuItem::SafeRViz => {
-                        let config_file = if self.available_rviz_configs.is_empty() {
-                            "titan.rviz".to_string()
-                        } else {
-                            self.available_rviz_configs[self.rviz_config_selection_index].clone()
-                        };
-                        self.logs.push(format!("Spawning SAFE Remote RViz (Software Rendering) with config: {}... Cant see it? check fixed frame in rviz", config_file));
                         let cmd_str = format!("gnome-terminal -- bash -c 'LIBGL_ALWAYS_SOFTWARE=1 rviz2 -d ~/titan_ws/src/titan_bringup/rviz_config/{}; exec bash'", config_file);
                         let _ = Command::new("bash").arg("-c").arg(cmd_str).spawn().map(|child| self.active_process = Some(child));
                     },
@@ -447,14 +431,6 @@ impl App {
                         let build_cmd = format!("cd {}/titan_ws && colcon build --symlink-install", home);
                         let output = Command::new("bash").arg("-c").arg(build_cmd).output();
                         self.handle_output(output, "Rebuild complete.");
-                    },
-                    MenuItem::StopProcess => {
-                        if let Some(mut child) = self.active_process.take() {
-                            let _ = child.kill();
-                            self.logs.push("Background process terminated.".to_string());
-                        } else {
-                            self.logs.push("No background process active.".to_string());
-                        }
                     },
                     MenuItem::KillAll => {
                         self.logs.push(self.translate_log("pkill -9 -f ros2"));
