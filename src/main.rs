@@ -37,6 +37,7 @@ enum MenuItem {
     Battery,
     Rebuild,
     StopProcess,
+    KillAll,
     // Laptop Remote (Instructions)
     RemoteTeleop,
     RemoteRViz,
@@ -53,6 +54,7 @@ impl MenuItem {
             MenuItem::Battery => "[Sys] POWER/BATTERY".to_string(),
             MenuItem::Rebuild => "[Sys] REBUILD WORKSPACE".to_string(),
             MenuItem::StopProcess => "[Sys] STOP BACKGROUND PROC".to_string(),
+            MenuItem::KillAll => "[Sys] KILL ALL ROS2 PROC".to_string(),
             MenuItem::RemoteTeleop => "[Laptop] REMOTE TELEOP".to_string(),
             MenuItem::RemoteRViz => "[Laptop] REMOTE RVIZ".to_string(),
         }
@@ -131,6 +133,7 @@ impl App {
                 MenuItem::Battery,
                 MenuItem::Rebuild,
                 MenuItem::StopProcess,
+                MenuItem::KillAll,
                 MenuItem::RemoteTeleop,
                 MenuItem::RemoteRViz,
             ],
@@ -166,7 +169,7 @@ impl App {
                 (DeviceType::Laptop, MenuItem::Mapping) | (DeviceType::Laptop, MenuItem::Navigation) |
                 (DeviceType::Laptop, MenuItem::SaveMap) | (DeviceType::Laptop, MenuItem::CheckUSB) |
                 (DeviceType::Laptop, MenuItem::Battery) | (DeviceType::Laptop, MenuItem::Rebuild) |
-                (DeviceType::Laptop, MenuItem::StopProcess) => false,
+                (DeviceType::Laptop, MenuItem::StopProcess) | (DeviceType::Laptop, MenuItem::KillAll) => false,
                 _ => true,
             }
         }).cloned().collect()
@@ -296,6 +299,7 @@ impl App {
         else if msg.contains("teleop_twist_keyboard") { "Opening Teleop Terminal...".to_string() }
         else if msg.contains("map_saver_cli") { "Compressing & Saving Map Data...".to_string() }
         else if msg.contains("colcon build") { "Compiling Workspace Packages...".to_string() }
+        else if msg.contains("pkill -9 -f ros2") { "CRITICAL: PURGING ALL ROS2 PROCESSES...".to_string() }
         else { msg.to_string() }
     }
 
@@ -430,6 +434,14 @@ impl App {
                         } else {
                             self.logs.push("No background process active.".to_string());
                         }
+                    },
+                    MenuItem::KillAll => {
+                        self.logs.push(self.translate_log("pkill -9 -f ros2"));
+                        let kill_cmd = "pkill -9 -f ros2; pkill -9 -f ydlidar; pkill -9 -f slam_toolbox; pkill -9 -f arduino_bridge; ros2 daemon stop; ros2 daemon start";
+                        let _ = Command::new("bash").arg("-c").arg(kill_cmd).output();
+                        self.logs.push("Global Reset Complete.".to_string());
+                        self.operation_status = "IDLE".to_string();
+                        self.active_process = None;
                     },
                     _ => {}
                 }
