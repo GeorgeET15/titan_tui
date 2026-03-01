@@ -280,6 +280,16 @@ impl App {
 
     fn update_wifi_list(&mut self) {
         self.logs.push("Scanning for all available WiFi networks...".to_string());
+        
+        // Trigger a hardware rescan first (requires sudo for reliability)
+        let _ = Command::new("bash")
+            .arg("-c")
+            .arg("echo \"pi@bin\" | sudo -S nmcli dev wifi rescan")
+            .output();
+
+        // Wait a moment for the scan to complete
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
         let output = Command::new("nmcli")
             .args(["-t", "-f", "SSID", "dev", "wifi", "list"])
             .output();
