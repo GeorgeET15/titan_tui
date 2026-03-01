@@ -279,9 +279,9 @@ impl App {
     }
 
     fn update_wifi_list(&mut self) {
-        self.logs.push("Scanning for WiFi networks (USB Adapter)...".to_string());
+        self.logs.push("Scanning for all available WiFi networks...".to_string());
         let output = Command::new("nmcli")
-            .args(["-t", "-f", "SSID", "dev", "wifi", "list", "ifname", "wlxd03745f25a51"])
+            .args(["-t", "-f", "SSID", "dev", "wifi", "list"])
             .output();
 
         if let Ok(out) = output {
