@@ -123,6 +123,10 @@ struct App {
     wifi_selection_index: usize,
     selected_ssid: String,
     wifi_password_input: String,
+    
+    // UX Enhancements
+    is_loading: bool,
+    loading_message: String,
 }
 
 impl App {
@@ -172,6 +176,8 @@ impl App {
             wifi_selection_index: 0,
             selected_ssid: String::new(),
             wifi_password_input: String::new(),
+            is_loading: false,
+            loading_message: String::new(),
         }
     }
 
@@ -275,21 +281,47 @@ impl App {
     }
 
     fn update_wifi_list(&mut self) {
-        self.logs.push("Scanning for WiFi networks (USB Adapter)...".to_string());
+        self.is_loading = true;
+        self.loading_message = "Scanning for WiFi networks...".to_string();
+        self.logs.push("Refreshing WiFi list (USB Adapter)...".to_string());
+        
+        // Force a rescan first
+        let _ = Command::new("nmcli")
+            .args(["device", "wifi", "rescan", "ifname", "wlxd03745f25a51"])
+            .output();
+
         let output = Command::new("nmcli")
-            .args(["-t", "-f", "SSID", "dev", "wifi", "list", "ifname", "wlxd03745f25a51"])
+            .args(["-t", "-f", "SSID,SIGNAL", "dev", "wifi", "list", "ifname", "wlxd03745f25a51"])
             .output();
 
         if let Ok(out) = output {
             let s = String::from_utf8_lossy(&out.stdout);
-            let mut ssids: Vec<String> = s.lines()
-                .filter(|line| !line.is_empty() && *line != "--")
-                .map(|line| line.to_string())
+            let mut entries: Vec<(String, i32)> = s.lines()
+                .filter(|line| !line.is_empty() && !line.starts_with("--"))
+                .filter_map(|line| {
+                    let parts: Vec<&str> = line.split(':').collect();
+                    if parts.len() >= 2 {
+                        let ssid = parts[0].to_string();
+                        let signal = parts[1].parse::<i32>().unwrap_or(0);
+                        Some((ssid, signal))
+                    } else {
+                        None
+                    }
+                })
                 .collect();
             
-            ssids.sort();
-            ssids.dedup();
-            self.available_ssids = ssids;
+            // Deduplicate by taking strongest signal
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut unique_ssids = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for (ssid, signal) in entries {
+                if !seen.contains(&ssid) {
+                    seen.insert(ssid.clone());
+                    unique_ssids.push(format!("{} ({}%)", ssid, signal));
+                }
+            }
+            
+            self.available_ssids = unique_ssids;
             
             if self.available_ssids.is_empty() {
                 self.logs.push("No WiFi networks found.".to_string());
@@ -299,29 +331,36 @@ impl App {
         } else {
             self.logs.push("Error: Failed to scan for WiFi.".to_string());
         }
+        self.is_loading = false;
     }
 
     fn perform_wifi_connection(&mut self) {
-        let ssid = self.selected_ssid.clone();
-        let pass = self.wifi_password_input.clone();
-        self.logs.push(format!("Connecting to {}...", ssid));
+        self.is_loading = true;
+        self.loading_message = format!("Connecting to {}...", self.selected_ssid);
         
-        let cmd = format!("echo \"pi@bin\" | sudo -S nmcli device wifi connect \"{}\" password \"{}\" ifname wlxd03745f25a51", ssid, pass);
+        let ssid_raw = self.selected_ssid.split(" (").next().unwrap_or(&self.selected_ssid).to_string();
+        let pass = self.wifi_password_input.clone();
+        self.logs.push(format!("Connecting to {}...", ssid_raw));
+        
+        let cmd = format!("echo \"pi@bin\" | sudo -S nmcli device wifi connect \"{}\" password \"{}\" ifname wlxd03745f25a51", ssid_raw, pass);
         let output = Command::new("bash").arg("-c").arg(cmd).output();
         
         match output {
             Ok(out) => {
                 if out.status.success() {
-                    self.logs.push(format!("Successfully connected to {}!", ssid));
+                    self.logs.push(format!("Successfully connected to {}!", ssid_raw));
                     self.operation_status = "IDLE".to_string();
+                    self.screen = Screen::Main;
                 } else {
                     let err = String::from_utf8_lossy(&out.stderr);
                     self.logs.push(format!("Connection failed: {}", err));
+                    // Stay on password screen if failed? Or go back to scan?
+                    // User might want to retry password.
                 }
             },
             Err(e) => self.logs.push(format!("Execution error: {}", e)),
         }
-        self.screen = Screen::Main;
+        self.is_loading = false;
         self.wifi_password_input.clear();
     }
 
@@ -498,11 +537,14 @@ impl App {
                         }
                     },
                     MenuItem::Rebuild => {
+                        self.is_loading = true;
+                        self.loading_message = "Rebuilding Workspace...".to_string();
                         self.logs.push("Rebuilding...".to_string());
                         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pidev".to_string());
                         let build_cmd = format!("cd {}/titan_ws && colcon build --symlink-install", home);
                         let output = Command::new("bash").arg("-c").arg(build_cmd).output();
                         self.handle_output(output, "Rebuild complete.");
+                        self.is_loading = false;
                     },
                     MenuItem::KillAll => {
                         self.logs.push(self.translate_log("pkill -9 -f ros2"));
@@ -635,6 +677,10 @@ async fn run_app<B: ratatui::backend::Backend>(
         terminal.draw(|f| {
             let size = f.size();
             
+            if app.is_loading {
+                render_loader(f, &app.loading_message, app.spinner_frame);
+            }
+
             if app.screen == Screen::Banner {
                 let main_block = Block::default()
                     .borders(Borders::ALL)
@@ -1295,7 +1341,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                 } else if app.screen == Screen::WifiScan {
                     if key.kind == crossterm::event::KeyEventKind::Press {
                         match key.code {
-                            KeyCode::Esc => app.screen = Screen::Main,
+                            KeyCode::Esc => {
+                                app.screen = Screen::Main;
+                            },
                             KeyCode::Up => {
                                 if app.wifi_selection_index > 0 { app.wifi_selection_index -= 1; }
                             },
@@ -1315,7 +1363,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                 } else if app.screen == Screen::WifiPasswordInput {
                     if key.kind == crossterm::event::KeyEventKind::Press {
                         match key.code {
-                            KeyCode::Esc => app.screen = Screen::Main,
+                            KeyCode::Esc => {
+                                app.screen = Screen::WifiScan;
+                            },
                             KeyCode::Backspace => { app.wifi_password_input.pop(); },
                             KeyCode::Char(c) => { app.wifi_password_input.push(c); },
                             KeyCode::Enter => {
@@ -1361,4 +1411,30 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ].as_ref())
         .split(popup_layout[1])[1]
+}
+
+fn render_loader(f: &mut ratatui::Frame, message: &str, frame: usize) {
+    let area = centered_rect(60, 20, f.size());
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+    let spinner = frames[frame % 8];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let text = vec![
+        Line::from(vec![
+            Span::styled(format!(" {} ", spinner), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(message, Style::default().fg(Color::White)),
+        ]),
+        Line::from(" Please wait... "),
+    ];
+
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center);
+
+    f.render_widget(ratatui::widgets::Clear, area); // Clear background
+    f.render_widget(paragraph, area);
 }
