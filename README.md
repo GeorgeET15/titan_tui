@@ -1,9 +1,11 @@
-# TRIDENT v0.1.0 🔱
+# TRIDENT v0.2.0 🔱
 
 **TRIDENT** (**Tactical Remote Interface for Detailed Exploration and Navigation of TITAN**) is a high-performance, premium cockpit for the TITAN robot suite. Built with **Rust** and **ROS 2**, it provides a military-grade tactical interface for real-time mission control and autonomous navigation management.
 
 ## ✨ Features
 - **Dynamic Teleop Configuration**: Tune linear speed and angular turn profiles on the fly via a sleek modal dialog before launching control nodes.
+*   **Kill All Processes (Emergency Reset)**: Instantly purge all active ROS 2 nodes and clear the TF cache for quick system recovery.
+*   **Human-Friendly Logging**: Real-time translation of technical ROS output into clear English status updates.
 - **Interactive Map Selection**: Automatically scans the robot's maps directory and allows selecting specific `.yaml` maps for navigation.
 - **Tactical Dashboard**: Re-engineered UI with neutral tones for high visibility, reduced eye strain, and color-coded survival telemetry.
 - **Live ROS 2 Telemetry**: Subscribes directly to `/odom` for real-time tracking of Position (X, Y) and Orientation (Theta).

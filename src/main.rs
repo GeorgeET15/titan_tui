@@ -636,7 +636,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     .alignment(Alignment::Center);
 
                 let metadata = Paragraph::new(Line::from(vec![
-                    Span::styled("v0.1.0", Style::default().fg(Color::Cyan)),
+                    Span::styled("v0.2.0", Style::default().fg(Color::Cyan)),
                     Span::raw(" | "),
                     Span::styled("Target: ROS2 Jazzy", Style::default().fg(Color::Green)),
                     Span::raw(" | "),
@@ -666,7 +666,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     ].as_ref())
                     .split(size);
 
-                let title = Paragraph::new("TRIDENT CONTROL SYSTEM v0.1.0")
+                let title = Paragraph::new("TRIDENT CONTROL SYSTEM v0.2.0")
                     .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
                     .alignment(Alignment::Center)
                     .block(Block::default().borders(Borders::ALL));
