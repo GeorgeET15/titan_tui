@@ -123,6 +123,8 @@ struct App {
     wifi_selection_index: usize,
     selected_ssid: String,
     wifi_password_input: String,
+    is_loading: bool,
+    loading_message: String,
 }
 
 impl App {
@@ -172,6 +174,8 @@ impl App {
             wifi_selection_index: 0,
             selected_ssid: String::new(),
             wifi_password_input: String::new(),
+            is_loading: false,
+            loading_message: String::new(),
         }
     }
 
@@ -289,7 +293,9 @@ impl App {
             
             ssids.sort();
             ssids.dedup();
-            self.available_ssids = ssids;
+            let mut final_ssids = vec!["[ BACK ]".to_string()];
+            final_ssids.extend(ssids);
+            self.available_ssids = final_ssids;
             
             if self.available_ssids.is_empty() {
                 self.logs.push("No WiFi networks found.".to_string());
@@ -491,17 +497,25 @@ impl App {
                         self.map_name_input.clear();
                     },
                     MenuItem::ConnectWiFi => {
+                        self.is_loading = true;
+                        self.loading_message = "Scanning for WiFi...".to_string();
+                        // We need a way to render once before the blocking scan
+                        // For now we just run it, but in a real app we'd use a thread
                         self.update_wifi_list();
+                        self.is_loading = false;
                         if !self.available_ssids.is_empty() {
                             self.screen = Screen::WifiScan;
                             self.wifi_selection_index = 0;
                         }
                     },
                     MenuItem::Rebuild => {
+                        self.is_loading = true;
+                        self.loading_message = "Rebuilding Workspace...".to_string();
                         self.logs.push("Rebuilding...".to_string());
                         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pidev".to_string());
                         let build_cmd = format!("cd {}/titan_ws && colcon build --symlink-install", home);
                         let output = Command::new("bash").arg("-c").arg(build_cmd).output();
+                        self.is_loading = false;
                         self.handle_output(output, "Rebuild complete.");
                     },
                     MenuItem::KillAll => {
@@ -1171,6 +1185,23 @@ async fn run_app<B: ratatui::backend::Backend>(
                 f.render_widget(logs_panel, body_chunks[2]);
                 f.render_widget(footer, chunks[2]);
             }
+
+            if app.is_loading {
+                let area = centered_rect(30, 15, size);
+                f.render_widget(ratatui::widgets::Clear, area); // Clear the area before rendering popup
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Thick)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(" SYSTEM BUSY ");
+                
+                let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"][app.spinner_frame];
+                let text = format!("\n  {} {}...", spinner, app.loading_message);
+                let loading = Paragraph::new(text)
+                    .alignment(Alignment::Center)
+                    .block(block);
+                f.render_widget(loading, area);
+            }
         })?;
 
         if crossterm::event::poll(Duration::from_millis(100))? {
@@ -1305,9 +1336,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 }
                             },
                             KeyCode::Enter => {
-                                app.selected_ssid = app.available_ssids[app.wifi_selection_index].clone();
-                                app.wifi_password_input.clear();
-                                app.screen = Screen::WifiPasswordInput;
+                                let selection = app.available_ssids[app.wifi_selection_index].clone();
+                                if selection == "[ BACK ]" {
+                                    app.screen = Screen::Main;
+                                } else {
+                                    app.selected_ssid = selection;
+                                    app.wifi_password_input.clear();
+                                    app.screen = Screen::WifiPasswordInput;
+                                }
                             },
                             _ => {}
                         }
