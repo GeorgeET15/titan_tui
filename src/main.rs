@@ -1052,6 +1052,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 app.screen = Screen::Main;
                             }
                         },
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            app.screen = Screen::WaypointNameInput;
+                            app.waypoint_name_input.clear();
+                        },
                         KeyCode::Delete => {
                             if app.waypoint_selection_index < app.waypoints.len() {
                                 app.waypoints.remove(app.waypoint_selection_index);
