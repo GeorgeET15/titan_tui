@@ -990,7 +990,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }).collect();
                 let logs_panel = List::new(logs).block(Block::default().borders(Borders::ALL).title(" SYSTEM LOGS "));
 
-                let footer = Paragraph::new(" role: ".to_owned() + app.device_type.to_string() + " | arrows: select | enter: exec | r: reset odom | q: quit")
+                let footer = Paragraph::new(" role: ".to_owned() + app.device_type.to_string() + " | arrows: select | enter: exec | c: clear | r: reset odom | q: quit")
                     .alignment(Alignment::Center).block(Block::default().borders(Borders::ALL));
 
                 f.render_widget(header, chunks[0]);
@@ -1085,6 +1085,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 app.save_waypoints();
                             }
                         },
+                        KeyCode::Char('c') | KeyCode::Char('C') => {
+                            app.logs.clear();
+                        },
                         _ => {}
                     }
                 } else if app.screen == Screen::WaypointNameInput {
@@ -1150,6 +1153,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                         KeyCode::Up => if app.active_menu_index > 0 { app.active_menu_index -= 1; },
                         KeyCode::Down => if app.active_menu_index < app.get_filtered_menu().len()-1 { app.active_menu_index += 1; },
                         KeyCode::Enter => app.execute_selected(),
+                        KeyCode::Char('c') | KeyCode::Char('C') => {
+                            app.logs.clear();
+                        },
                         KeyCode::Char('r') | KeyCode::Char('R') => {
                             let _ = app.ros_cmd_tx.send(RosCommand::ResetOdom);
                             app.logs.push("Sent Odometry Reset command.".to_string());
