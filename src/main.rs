@@ -1106,6 +1106,45 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
                         }, _ => {}
                     }
+                } else if app.screen == Screen::MapSelect {
+                    match key.code {
+                        KeyCode::Esc => app.screen = Screen::Main,
+                        KeyCode::Up => if app.map_selection_index > 0 { app.map_selection_index -= 1; },
+                        KeyCode::Down => if app.map_selection_index < app.available_maps.len() - 1 { app.map_selection_index += 1; },
+                        KeyCode::Enter => app.execute_selected(),
+                        _ => {}
+                    }
+                } else if app.screen == Screen::RVizConfigSelect {
+                    match key.code {
+                        KeyCode::Esc => app.screen = Screen::Main,
+                        KeyCode::Up => if app.rviz_config_selection_index > 0 { app.rviz_config_selection_index -= 1; },
+                        KeyCode::Down => if app.rviz_config_selection_index < app.available_rviz_configs.len() - 1 { app.rviz_config_selection_index += 1; },
+                        KeyCode::Enter => app.execute_selected(),
+                        _ => {}
+                    }
+                } else if app.screen == Screen::WifiScan {
+                    match key.code {
+                        KeyCode::Esc => app.screen = Screen::Main,
+                        KeyCode::Up => if app.wifi_selection_index > 0 { app.wifi_selection_index -= 1; },
+                        KeyCode::Down => if app.wifi_selection_index < app.available_ssids.len() - 1 { app.wifi_selection_index += 1; },
+                        KeyCode::Enter => {
+                            app.selected_ssid = app.available_ssids[app.wifi_selection_index].clone();
+                            app.screen = Screen::WifiPasswordInput;
+                            app.wifi_password_input.clear();
+                        },
+                        _ => {}
+                    }
+                } else if app.screen == Screen::WifiPasswordInput {
+                    match key.code {
+                        KeyCode::Esc => app.screen = Screen::WifiScan,
+                        KeyCode::Backspace => { app.wifi_password_input.pop(); },
+                        KeyCode::Char(c) => { app.wifi_password_input.push(c); },
+                        KeyCode::Enter => {
+                            app.perform_wifi_connection();
+                            app.screen = Screen::Main;
+                        },
+                        _ => {}
+                    }
                 } else if app.screen == Screen::Main {
                     match key.code {
                         KeyCode::Up => if app.active_menu_index > 0 { app.active_menu_index -= 1; },
