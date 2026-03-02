@@ -909,8 +909,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                 let area = centered_rect(50, 35, size);
                 let block = Block::default().borders(Borders::ALL).title(" TELEOP CONFIGURATION ");
                 let inner = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)]).margin(2).split(area);
-                let speed_field = Paragraph::new(format!(" Speed: {}_", app.teleop_speed)).block(Block::default().borders(Borders::ALL).title(" LINEAR "));
-                let turn_field = Paragraph::new(format!(" Turn: {}_", app.teleop_turn)).block(Block::default().borders(Borders::ALL).title(" ANGULAR "));
+                let speed_style = if app.teleop_field_index == 0 { Style::default().fg(Color::Yellow) } else { Style::default() };
+                let turn_style = if app.teleop_field_index == 1 { Style::default().fg(Color::Yellow) } else { Style::default() };
+                let speed_field = Paragraph::new(format!(" Speed: {}_", app.teleop_speed)).block(Block::default().borders(Borders::ALL).title(" LINEAR ").border_style(speed_style));
+                let turn_field = Paragraph::new(format!(" Turn: {}_", app.teleop_turn)).block(Block::default().borders(Borders::ALL).title(" ANGULAR ").border_style(turn_style));
                 f.render_widget(block, area);
                 f.render_widget(speed_field, inner[0]);
                 f.render_widget(turn_field, inner[1]);
@@ -1010,6 +1012,27 @@ async fn run_app<B: ratatui::backend::Backend>(
                         KeyCode::Enter => {
                             app.device_type = if app.selection_index == 0 { DeviceType::Titan } else { DeviceType::Laptop };
                             app.run_diagnostics(); app.splash_start = std::time::Instant::now(); app.screen = Screen::Splash;
+                        },
+                        _ => {}
+                    }
+                } else if app.screen == Screen::TeleopConfig {
+                    match key.code {
+                        KeyCode::Esc => app.screen = Screen::Main,
+                        KeyCode::Up | KeyCode::Down => {
+                            app.teleop_field_index = if app.teleop_field_index == 0 { 1 } else { 0 };
+                        },
+                        KeyCode::Backspace => {
+                            if app.teleop_field_index == 0 { app.teleop_speed.pop(); }
+                            else { app.teleop_turn.pop(); }
+                        },
+                        KeyCode::Char(c) => {
+                            if c.is_digit(10) || c == '.' {
+                                if app.teleop_field_index == 0 { app.teleop_speed.push(c); }
+                                else { app.teleop_turn.push(c); }
+                            }
+                        },
+                        KeyCode::Enter => {
+                            app.execute_selected();
                         },
                         _ => {}
                     }
