@@ -227,10 +227,17 @@ impl App {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pidev".to_string());
         let path = format!("{}/titan_ws/src/titan_bringup/config/waypoints.yaml", home);
         if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(data) = serde_yaml::from_str::<WaypointFile>(&content) {
-                self.waypoints = data.waypoints;
-                self.logs.push(format!("Loaded {} waypoints.", self.waypoints.len()));
+            match serde_yaml::from_str::<WaypointFile>(&content) {
+                Ok(data) => {
+                    self.waypoints = data.waypoints;
+                    self.logs.push(format!("Loaded {} waypoints from disk.", self.waypoints.len()));
+                },
+                Err(e) => {
+                    self.logs.push(format!("Error parsing waypoints.yaml: {}", e));
+                }
             }
+        } else {
+            self.logs.push("No waypoints.yaml found, starting fresh.".to_string());
         }
     }
 
@@ -238,9 +245,16 @@ impl App {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pidev".to_string());
         let path = format!("{}/titan_ws/src/titan_bringup/config/waypoints.yaml", home);
         let data = WaypointFile { waypoints: self.waypoints.clone() };
-        if let Ok(content) = serde_yaml::to_string(&data) {
-            if fs::write(&path, content).is_ok() {
-                self.logs.push("Waypoints saved to disk.".to_string());
+        match serde_yaml::to_string(&data) {
+            Ok(content) => {
+                if let Err(e) = fs::write(&path, content) {
+                    self.logs.push(format!("Error saving waypoints: {}", e));
+                } else {
+                    self.logs.push("Waypoints successfully saved to disk.".to_string());
+                }
+            },
+            Err(e) => {
+                self.logs.push(format!("Error serializing waypoints: {}", e));
             }
         }
     }
@@ -502,8 +516,10 @@ impl App {
                 }
             },
             MenuItem::Waypoints => {
-                self.screen = Screen::WaypointList;
-            },
+            self.load_waypoints();
+            self.screen = Screen::WaypointList;
+            self.waypoint_selection_index = 0;
+        },
             _ => {
                 if self.screen != Screen::MapSelect && item == MenuItem::Navigation {
                     self.update_maps_list();
