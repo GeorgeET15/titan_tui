@@ -12,7 +12,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use anyhow::Result;
-use std::{io, time::Duration, process::{Command, Child}, fs};
+use std::{io, time::Duration, process::{Command, Child, Stdio}, fs};
 use futures::StreamExt;
 use r2r::nav_msgs::msg::Odometry;
 use r2r::geometry_msgs::msg::{PoseStamped, PoseWithCovarianceStamped, Quaternion};
@@ -566,6 +566,8 @@ impl App {
                             let tmux_cmd = format!("ros2 run teleop_twist_keyboard teleop_twist_keyboard {}", ros_args);
                             let _ = Command::new("tmux")
                                 .args(["split-window", "-h", &tmux_cmd])
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
                                 .spawn();
                         } else {
                             self.logs.push("Error: Local Teleop requires tmux split!".to_string());
@@ -578,7 +580,13 @@ impl App {
 
                         self.logs.push(format!("Spawning Remote Teleop (s={}, t={}) in new window...", speed, turn));
                         let cmd_str = format!("gnome-terminal -- bash -c 'ros2 run teleop_twist_keyboard teleop_twist_keyboard {}; exec bash'", ros_args);
-                        let _ = Command::new("bash").arg("-c").arg(cmd_str).spawn().map(|child| self.active_process = Some(child));
+                        let _ = Command::new("bash")
+                            .arg("-c")
+                            .arg(cmd_str)
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                            .map(|child| self.active_process = Some(child));
                     },
                     MenuItem::RemoteRViz => {
                         let config_file = if self.available_rviz_configs.is_empty() {
@@ -588,7 +596,13 @@ impl App {
                         };
                         self.logs.push(format!("Spawning Remote RViz with config: {}...", config_file));
                         let cmd_str = format!("gnome-terminal -- bash -c 'LIBGL_ALWAYS_SOFTWARE=1 rviz2 -d ~/titan_ws/src/titan_bringup/rviz_config/{}; exec bash'", config_file);
-                        let _ = Command::new("bash").arg("-c").arg(cmd_str).spawn().map(|child| self.active_process = Some(child));
+                        let _ = Command::new("bash")
+                            .arg("-c")
+                            .arg(cmd_str)
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                            .map(|child| self.active_process = Some(child));
                     },
                     MenuItem::SaveMap => {
                         self.screen = Screen::MapNameInput;
@@ -636,22 +650,37 @@ impl App {
         if self.device_type == DeviceType::Laptop {
             self.logs.push(format!("Laptop Mode: {} launching in new window...", file));
             let terminal_cmd = format!("gnome-terminal -- bash -c \"{}; exec bash\"", cmd_str);
-            let _ = Command::new("bash").arg("-c").arg(&terminal_cmd).spawn().map(|child| self.active_process = Some(child));
+            let _ = Command::new("bash")
+                .arg("-c")
+                .arg(&terminal_cmd)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(|child| self.active_process = Some(child));
             return;
         }
 
         let is_tmux = std::env::var("TMUX").is_ok();
         if is_tmux {
             self.logs.push("Spawning in tmux split...".to_string());
-            let _ = Command::new("tmux").args(["split-window", "-h", &cmd_str]).spawn();
+            let _ = Command::new("tmux")
+                .args(["split-window", "-h", &cmd_str])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
         } else {
             if self.active_process.is_some() {
                 if let Some(mut child) = self.active_process.take() {
                     let _ = child.kill();
                 }
             }
-            self.logs.push(self.translate_log(&format!("Launching: {}...", file)));
-            let _ = Command::new("bash").arg("-c").arg(&cmd_str).spawn().map(|child| self.active_process = Some(child));
+            let _ = Command::new("bash")
+                .arg("-c")
+                .arg(&cmd_str)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(|child| self.active_process = Some(child));
         }
     }
 
