@@ -198,7 +198,7 @@ impl App {
             selection_index: 0,
             map_name_input: String::new(),
             teleop_speed: "0.1".to_string(),
-            teleop_turn: "0.7".to_string(),
+            teleop_turn: "0.5".to_string(),
             teleop_field_index: 0,
             pending_teleop_item: None,
             available_maps: Vec::new(),
