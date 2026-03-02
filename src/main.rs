@@ -12,16 +12,29 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use anyhow::Result;
-use std::{io, time::Duration, process::{Command, Child}};
+use std::{io, time::Duration, process::{Command, Child}, fs};
 use futures::StreamExt;
 use r2r::nav_msgs::msg::Odometry;
-use tokio::sync::watch;
+use r2r::geometry_msgs::msg::{PoseStamped, PoseWithCovarianceStamped, Quaternion};
+use r2r::builtin_interfaces::msg::Time;
+use tokio::sync::{watch, mpsc};
+use serde::{Serialize, Deserialize};
+use r2r::std_msgs::msg::Empty as EmptyMsg;
+
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
+struct Waypoint {
+    name: String,
+    x: f64,
+    y: f64,
+    theta: f64,
+}
 
 #[derive(Clone, Default)]
 struct Telemetry {
     x: f64,
     y: f64,
     theta: f64,
+    stamp: Time,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -32,6 +45,7 @@ enum MenuItem {
     Mapping,
     Cartographer,
     Navigation,
+    Waypoints,
     SaveMap,
     // System
     CheckUSB,
@@ -51,6 +65,7 @@ impl MenuItem {
             MenuItem::Mapping => "[Robot] START MAPPING (SLAM TOOLBOX)".to_string(),
             MenuItem::Cartographer => "[Robot] START MAPPING (CARTOGRAPHER)".to_string(),
             MenuItem::Navigation => "[Robot] START NAV2".to_string(),
+            MenuItem::Waypoints => "[Robot] WAYPOINTS / NAV ".to_string(),
             MenuItem::SaveMap => "[Robot] SAVE MAP".to_string(),
             MenuItem::CheckUSB => "[Sys] CHECK USB/SERIAL".to_string(),
             MenuItem::Battery => "[Sys] POWER/BATTERY".to_string(),
@@ -91,6 +106,8 @@ enum Screen {
     RVizConfigSelect,
     WifiScan,
     WifiPasswordInput,
+    WaypointList,
+    WaypointNameInput,
     Main,
 }
 
@@ -124,14 +141,31 @@ struct App {
     selected_ssid: String,
     wifi_password_input: String,
     
+    // Waypoints
+    waypoints: Vec<Waypoint>,
+    waypoint_selection_index: usize,
+    waypoint_name_input: String,
+    ros_cmd_tx: mpsc::UnboundedSender<RosCommand>,
+
     // UX Enhancements
     is_loading: bool,
     loading_message: String,
 }
 
+enum RosCommand {
+    NavTo(Waypoint),
+    SetPose(Waypoint),
+    ResetOdom,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WaypointFile {
+    waypoints: Vec<Waypoint>,
+}
+
 impl App {
-    fn new(telemetry_rx: watch::Receiver<Telemetry>) -> App {
-        App {
+    fn new(telemetry_rx: watch::Receiver<Telemetry>, ros_cmd_tx: mpsc::UnboundedSender<RosCommand>) -> App {
+        let mut app = App {
             logs: vec![
                 "TITAN System initialized".to_string(),
                 "Ready for commands".to_string(),
@@ -142,6 +176,7 @@ impl App {
                 MenuItem::Mapping,
                 MenuItem::Cartographer,
                 MenuItem::Navigation,
+                MenuItem::Waypoints,
                 MenuItem::SaveMap,
                 MenuItem::CheckUSB,
                 MenuItem::Battery,
@@ -176,8 +211,36 @@ impl App {
             wifi_selection_index: 0,
             selected_ssid: String::new(),
             wifi_password_input: String::new(),
+            waypoints: Vec::new(),
+            waypoint_selection_index: 0,
+            waypoint_name_input: String::new(),
+            ros_cmd_tx,
             is_loading: false,
             loading_message: String::new(),
+        };
+        app.load_waypoints();
+        app
+    }
+
+    fn load_waypoints(&mut self) {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pidev".to_string());
+        let path = format!("{}/titan_ws/src/titan_bringup/config/waypoints.yaml", home);
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(data) = serde_yaml::from_str::<WaypointFile>(&content) {
+                self.waypoints = data.waypoints;
+                self.logs.push(format!("Loaded {} waypoints.", self.waypoints.len()));
+            }
+        }
+    }
+
+    fn save_waypoints(&mut self) {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pidev".to_string());
+        let path = format!("{}/titan_ws/src/titan_bringup/config/waypoints.yaml", home);
+        let data = WaypointFile { waypoints: self.waypoints.clone() };
+        if let Ok(content) = serde_yaml::to_string(&data) {
+            if fs::write(&path, content).is_ok() {
+                self.logs.push("Waypoints saved to disk.".to_string());
+            }
         }
     }
 
@@ -187,6 +250,7 @@ impl App {
                 (DeviceType::Titan, MenuItem::RemoteTeleop) | (DeviceType::Titan, MenuItem::RemoteRViz) => false,
                 (DeviceType::Laptop, MenuItem::Bringup) | (DeviceType::Laptop, MenuItem::LocalTeleop) | 
                 (DeviceType::Laptop, MenuItem::Mapping) | (DeviceType::Laptop, MenuItem::Cartographer) | (DeviceType::Laptop, MenuItem::Navigation) |
+                (DeviceType::Laptop, MenuItem::Waypoints) |
                 (DeviceType::Laptop, MenuItem::SaveMap) | (DeviceType::Laptop, MenuItem::CheckUSB) |
                 (DeviceType::Laptop, MenuItem::Battery) | (DeviceType::Laptop, MenuItem::Rebuild) |
                 (DeviceType::Laptop, MenuItem::ConnectWiFi) | (DeviceType::Laptop, MenuItem::KillAll) => false,
@@ -354,8 +418,6 @@ impl App {
                 } else {
                     let err = String::from_utf8_lossy(&out.stderr);
                     self.logs.push(format!("Connection failed: {}", err));
-                    // Stay on password screen if failed? Or go back to scan?
-                    // User might want to retry password.
                 }
             },
             Err(e) => self.logs.push(format!("Execution error: {}", e)),
@@ -384,9 +446,7 @@ impl App {
                     self.active_process = None;
                     self.operation_status = "IDLE".to_string();
                 },
-                Ok(None) => {
-                    // Still running
-                },
+                Ok(None) => {},
                 Err(e) => {
                     self.logs.push(format!("Error checking process: {}", e));
                     self.active_process = None;
@@ -438,6 +498,9 @@ impl App {
                 for res in usb {
                     self.logs.push(format!("USB Check: {}", res));
                 }
+            },
+            MenuItem::Waypoints => {
+                self.screen = Screen::WaypointList;
             },
             _ => {
                 if self.screen != Screen::MapSelect && item == MenuItem::Navigation {
@@ -599,8 +662,6 @@ impl App {
                     let lines: Vec<&str> = stdout.lines()
                         .filter(|l| !l.trim().is_empty() && !l.contains("total 0"))
                         .collect();
-                    
-                    // Show only the last 15 lines of output to avoid flooding
                     let start = lines.len().saturating_sub(15);
                     for line in &lines[start..] {
                         self.logs.push(format!("  {}", line));
@@ -616,49 +677,79 @@ impl App {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ROS 2 Initialization
     let ctx = r2r::Context::create().expect("Failed to create ROS 2 context");
     let mut node = r2r::Node::create(ctx, "titan_tui", "").expect("Failed to create ROS 2 node");
     
     let (tx, rx) = watch::channel(Telemetry::default());
-    
-    // Subscribe to Odometry
-    let mut sub = node.subscribe::<Odometry>("/odom", r2r::QosProfile::default()).expect("Failed to subscribe to /odom");
-    
-    // Background ROS task (handles sub and spin in one loop)
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<RosCommand>();
+
+    // Background ROS task
     tokio::spawn(async move {
+        let mut sub = node.subscribe::<Odometry>("/odom", r2r::QosProfile::default()).expect("Failed to subscribe to /odom");
+        let goal_pub = node.create_publisher::<PoseStamped>("/goal_pose", r2r::QosProfile::default()).expect("Failed to create /goal_pose pub");
+        let init_pub = node.create_publisher::<PoseWithCovarianceStamped>("/initialpose", r2r::QosProfile::default()).expect("Failed to create /initialpose pub");
+        let reset_pub = node.create_publisher::<EmptyMsg>("/reset_odom", r2r::QosProfile::default()).expect("Failed to create /reset_odom pub");
+
         loop {
-            // Process ROS callbacks
             node.spin_once(std::time::Duration::from_millis(10));
-            
-            // Non-blocking check for new messages
-            // r2r's next() is async, so we use a very short timeout or just a small sleep
+            // Telemetry
             match tokio::time::timeout(std::time::Duration::from_millis(5), sub.next()).await {
                 Ok(Some(msg)) => {
                     let x = msg.pose.pose.position.x;
                     let y = msg.pose.pose.position.y;
-                    
                     let q = msg.pose.pose.orientation;
                     let siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
                     let cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
                     let theta = f64::atan2(siny_cosp, cosy_cosp);
-
-                    let _ = tx.send(Telemetry { x, y, theta });
+                    let stamp = msg.header.stamp.clone();
+                    let _ = tx.send(Telemetry { x, y, theta, stamp });
                 }
                 _ => {}
             }
+
+            // Commands
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    RosCommand::NavTo(wp) => {
+                        let mut msg = PoseStamped::default();
+                        msg.header.frame_id = "map".to_string();
+                        msg.header.stamp = tx.borrow().stamp.clone();
+                        msg.pose.position.x = wp.x;
+                        msg.pose.position.y = wp.y;
+                        msg.pose.orientation = euler_to_quaternion(wp.theta);
+                        let _ = goal_pub.publish(&msg);
+                    },
+                    RosCommand::SetPose(wp) => {
+                        let mut msg = PoseWithCovarianceStamped::default();
+                        msg.header.frame_id = "map".to_string();
+                        msg.header.stamp = tx.borrow().stamp.clone();
+                        msg.pose.pose.position.x = wp.x;
+                        msg.pose.pose.position.y = wp.y;
+                        msg.pose.pose.orientation = euler_to_quaternion(wp.theta);
+                        // Standard initial pose covariance
+                        msg.pose.covariance[0] = 0.25;
+                        msg.pose.covariance[7] = 0.25;
+                        msg.pose.covariance[35] = 0.06;
+                        let _ = init_pub.publish(&msg);
+                    },
+                    RosCommand::ResetOdom => {
+                        let msg = EmptyMsg::default();
+                        let _ = reset_pub.publish(&msg);
+                    }
+                }
+            }
+
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     });
 
-    // TUI Initialization
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(rx);
+    let mut app = App::new(rx, cmd_tx);
     let res = run_app(&mut terminal, &mut app).await;
 
     disable_raw_mode()?;
@@ -667,6 +758,15 @@ async fn main() -> Result<()> {
 
     if let Err(err) = res { println!("{:?}", err) }
     Ok(())
+}
+
+fn euler_to_quaternion(yaw: f64) -> Quaternion {
+    Quaternion {
+        x: 0.0,
+        y: 0.0,
+        z: (yaw * 0.5).sin(),
+        w: (yaw * 0.5).cos(),
+    }
 }
 
 async fn run_app<B: ratatui::backend::Backend>(
@@ -688,7 +788,6 @@ async fn run_app<B: ratatui::backend::Backend>(
                     .border_style(Style::default().fg(Color::Cyan))
                     .title(" [ TITAN CONTROL CENTER ] ")
                     .title_alignment(Alignment::Center);
-                
                 f.render_widget(main_block, size);
 
                 let chunks = Layout::default()
@@ -696,11 +795,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                     .constraints([
                         Constraint::Length((size.height as i32 - 24).max(0) as u16 / 2),
                         Constraint::Length(8), // TRIDENT ASCII
-                        Constraint::Length(1), // Subtitle (Backronym)
+                        Constraint::Length(1), // Subtitle
                         Constraint::Length(2), // Spacer
                         Constraint::Length(2), // Description
                         Constraint::Length(2), // Spacer
-                        Constraint::Length(1), // Version/Build
+                        Constraint::Length(1), // Version
                         Constraint::Min(0),    // Hint
                     ].as_ref())
                     .split(size);
@@ -713,27 +812,12 @@ async fn run_app<B: ratatui::backend::Backend>(
     ██║   ██║  ██║██║██████╔╝███████╗██║ ╚████║   ██║   
     ╚═╝   ╚═╝  ╚═╝╚═╝╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝   
                 "#;
-
                 let title = Paragraph::new(ascii_trident)
                     .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
                     .alignment(Alignment::Center);
                 
-                let subtitle = Paragraph::new(Line::from(vec![
-                    Span::styled("T", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::raw("actical "),
-                    Span::styled("R", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::raw("emote "),
-                    Span::styled("I", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::raw("nterface for "),
-                    Span::styled("D", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::raw("etailed "),
-                    Span::styled("E", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::raw("xploration and "),
-                    Span::styled("N", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::raw("avigation of "),
-                    Span::styled("T", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::raw("ITAN"),
-                ])).alignment(Alignment::Center);
+                let subtitle = Paragraph::new("Tactical Remote Interface for Detailed Exploration and Navigation of TITAN")
+                    .alignment(Alignment::Center);
 
                 let description_text = vec![
                     Line::from(vec![
@@ -747,18 +831,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                         Span::styled("Autonomous Mission Flow", Style::default().fg(Color::Yellow)),
                     ]),
                 ];
-                let description = Paragraph::new(description_text)
-                    .alignment(Alignment::Center);
+                let description = Paragraph::new(description_text).alignment(Alignment::Center);
 
-                let metadata = Paragraph::new(Line::from(vec![
-                    Span::styled("v0.2.0", Style::default().fg(Color::Cyan)),
-                    Span::raw(" | "),
-                    Span::styled("Target: ROS2 Jazzy", Style::default().fg(Color::Green)),
-                    Span::raw(" | "),
-                    Span::styled("Linux", Style::default().fg(Color::White)),
-                ]))
-                .alignment(Alignment::Center);
-
+                let metadata = Paragraph::new("v0.2.0 | Target: ROS2 Jazzy | Linux").alignment(Alignment::Center);
                 let hint = Paragraph::new("\n\nPress [ENTER] to continue | [q] to quit")
                     .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))
                     .alignment(Alignment::Center);
@@ -766,18 +841,18 @@ async fn run_app<B: ratatui::backend::Backend>(
                 f.render_widget(title, chunks[1]);
                 f.render_widget(subtitle, chunks[2]);
                 f.render_widget(description, chunks[4]); 
-                f.render_widget(metadata, chunks[6]); // Shifted for spacer
+                f.render_widget(metadata, chunks[6]);
                 f.render_widget(hint, chunks[7]);
 
             } else if app.screen == Screen::Splash {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(3), // Space
-                        Constraint::Length(3), // Title
-                        Constraint::Min(0),    // Checks
-                        Constraint::Length(3), // Progress Bar
-                        Constraint::Length(3), // Status
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Min(0),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
                     ].as_ref())
                     .split(size);
 
@@ -789,427 +864,130 @@ async fn run_app<B: ratatui::backend::Backend>(
                 let checks: Vec<ListItem> = app.startup_checks.iter()
                     .map(|s| {
                         let color = if s.contains("NOT FOUND") || s.contains("DISCONNECTED") || s.contains("CRITICAL") { Color::Red }
-                                   else if s.contains("Warning") || s.contains("LOW") || s.contains("CAPPED") || s.contains("Throttling") { Color::Yellow }
-                                   else if s.contains("CONNECTED") || s.contains("STABLE") || s.contains("OK") { Color::Green }
+                                   else if s.contains("Warning") || s.contains("LOW") { Color::Yellow }
+                                   else if s.contains("OK") || s.contains("CONNECTED") { Color::Green }
                                    else { Color::Gray };
                         ListItem::new(s.as_str()).style(Style::default().fg(color))
                     }).collect();
                 
-                let check_list = List::new(checks)
-                    .block(Block::default().borders(Borders::ALL).title(" SYSTEM DIAGNOSTICS "));
-
+                let check_list = List::new(checks).block(Block::default().borders(Borders::ALL).title(" SYSTEM DIAGNOSTICS "));
+                
                 let elapsed = app.splash_start.elapsed().as_secs_f32();
                 let progress = (elapsed / 3.0).min(1.0);
                 let gauge = Gauge::default()
                     .block(Block::default().borders(Borders::ALL).title(" INITIALIZING "))
-                    .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Black).add_modifier(Modifier::ITALIC))
+                    .gauge_style(Style::default().fg(Color::Cyan))
                     .ratio(progress as f64);
-
-                let status = Paragraph::new("INITIALIZING ROBOT...")
-                    .style(Style::default().fg(Color::DarkGray))
-                    .alignment(Alignment::Center);
 
                 f.render_widget(title, chunks[1]);
                 f.render_widget(check_list, chunks[2]);
                 f.render_widget(gauge, chunks[3]);
-                f.render_widget(status, chunks[4]);
 
-                if progress >= 1.0 {
-                    app.screen = Screen::Main;
-                }
+                if progress >= 1.0 { app.screen = Screen::Main; }
+
             } else if app.screen == Screen::DeviceSelect {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Percentage(30),
-                        Constraint::Length(10),
-                        Constraint::Min(0),
-                    ].as_ref())
-                    .split(size);
-
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .title(" DEVICE SELECTION ")
-                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-
+                let area = centered_rect(60, 30, size);
+                let block = Block::default().borders(Borders::ALL).title(" DEVICE SELECTION ").border_style(Style::default().fg(Color::Cyan));
                 let items = vec![
                     ListItem::new("  1. TITAN (Robot) - Controller Dashboard "),
                     ListItem::new("  2. LAPTOP (Remote) - Teleop & Monitoring "),
                 ];
-
-                let list = List::new(items)
-                    .block(block)
-                    .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                    .highlight_symbol(">> ");
-
+                let list = List::new(items).block(block).highlight_style(Style::default().fg(Color::Yellow));
                 let mut state = ratatui::widgets::ListState::default();
                 state.select(Some(app.selection_index));
-
-                // Center the selection box
-                let area = centered_rect(60, 30, size);
                 f.render_stateful_widget(list, area, &mut state);
-
-                let hint = Paragraph::new("Press Up/Down to choose, Enter to confirm | [q] to quit")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray));
-                f.render_widget(hint, chunks[2]);
 
             } else if app.screen == Screen::MapNameInput {
                 let area = centered_rect(60, 20, size);
-                
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .title(" SAVE MAP AS... ")
-                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-
-                let inner_area = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                        Constraint::Min(0),
-                    ].as_ref())
-                    .split(area);
-
-                let input_text = format!(" Name: {}_", app.map_name_input);
-                let input = Paragraph::new(input_text)
-                    .style(Style::default().fg(Color::Yellow))
-                    .block(block);
-
-                let hint = Paragraph::new("Enter: Save  |  Esc: Cancel")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray));
-
+                let input = Paragraph::new(format!(" Name: {}_", app.map_name_input))
+                    .block(Block::default().borders(Borders::ALL).title(" SAVE MAP AS... "));
                 f.render_widget(input, area);
-                f.render_widget(hint, inner_area[2]);
 
             } else if app.screen == Screen::TeleopConfig {
                 let area = centered_rect(50, 35, size);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .title(" TELEOP CONFIGURATION ")
-                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-                
-                let inner = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3), // Speed field
-                        Constraint::Length(3), // Turn field
-                        Constraint::Min(0),    // Hint
-                    ].as_ref())
-                    .margin(2)
-                    .split(area);
-
-                let speed_style = if app.teleop_field_index == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::Gray) };
-                let turn_style = if app.teleop_field_index == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::Gray) };
-
-                let speed_field = Paragraph::new(format!(" Speed: {}_", app.teleop_speed))
-                    .style(speed_style)
-                    .block(Block::default().borders(Borders::ALL).title(" [LINEAR SPEED] "));
-                
-                let turn_field = Paragraph::new(format!(" Turn: {}_", app.teleop_turn))
-                    .style(turn_style)
-                    .block(Block::default().borders(Borders::ALL).title(" [ANGULAR TURN] "));
-
-                let hint = Paragraph::new("Tab/Enter: Switch Field | Esc: Cancel | Enter (on last field): Launch")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray));
-
+                let block = Block::default().borders(Borders::ALL).title(" TELEOP CONFIGURATION ");
+                let inner = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)]).margin(2).split(area);
+                let speed_field = Paragraph::new(format!(" Speed: {}_", app.teleop_speed)).block(Block::default().borders(Borders::ALL).title(" LINEAR "));
+                let turn_field = Paragraph::new(format!(" Turn: {}_", app.teleop_turn)).block(Block::default().borders(Borders::ALL).title(" ANGULAR "));
                 f.render_widget(block, area);
                 f.render_widget(speed_field, inner[0]);
                 f.render_widget(turn_field, inner[1]);
-                f.render_widget(hint, inner[2]);
 
-            } else if app.screen == Screen::MapSelect {
+            } else if app.screen == Screen::MapSelect || app.screen == Screen::RVizConfigSelect {
                 let area = centered_rect(40, 50, size);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .title(" SELECT MAP FILE ")
-                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-                
-                let items: Vec<ListItem> = app.available_maps
-                    .iter()
-                    .enumerate()
-                    .map(|(i, m)| {
-                        let style = if i == app.map_selection_index {
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::White)
-                        };
-                        ListItem::new(format!(" {} ", m)).style(style)
-                    })
-                    .collect();
-
-                let list = List::new(items)
-                    .block(Block::default().borders(Borders::NONE))
-                    .highlight_symbol(">> ");
-
-                let hint = Paragraph::new("Arrows: Select | Enter: Launch | Esc: Cancel")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray));
-
-                let inner = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Min(0),
-                        Constraint::Length(1),
-                    ].as_ref())
-                    .margin(2)
-                    .split(area);
-
-                f.render_widget(block, area);
-                f.render_widget(list, inner[0]);
-                f.render_widget(hint, inner[1]);
-
-            } else if app.screen == Screen::RVizConfigSelect {
-                let area = centered_rect(40, 50, size);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .title(" SELECT RVIZ CONFIG ")
-                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-                
-                let items: Vec<ListItem> = app.available_rviz_configs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, m)| {
-                        let style = if i == app.rviz_config_selection_index {
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::White)
-                        };
-                        ListItem::new(format!(" {} ", m)).style(style)
-                    })
-                    .collect();
-
-                let list = List::new(items)
-                    .block(Block::default().borders(Borders::NONE))
-                    .highlight_symbol(">> ");
-
-                let hint = Paragraph::new("Arrows: Select | Enter: Launch | Esc: Cancel")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray));
-
-                let inner = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Min(0),
-                        Constraint::Length(1),
-                    ].as_ref())
-                    .margin(2)
-                    .split(area);
-
-                f.render_widget(block, area);
-                f.render_widget(list, inner[0]);
-                f.render_widget(hint, inner[1]);
+                let title = if app.screen == Screen::MapSelect { " SELECT MAP " } else { " SELECT RVIZ CONFIG " };
+                let items: Vec<ListItem> = (if app.screen == Screen::MapSelect { &app.available_maps } else { &app.available_rviz_configs })
+                    .iter().enumerate().map(|(i, m)| {
+                        let style = if i == (if app.screen == Screen::MapSelect { app.map_selection_index } else { app.rviz_config_selection_index }) {
+                            Style::default().fg(Color::Yellow)
+                        } else { Style::default().fg(Color::White) };
+                        ListItem::new(m.as_str()).style(style)
+                    }).collect();
+                let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+                f.render_widget(list, area);
 
             } else if app.screen == Screen::WifiScan {
                 let area = centered_rect(50, 60, size);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .title(" SELECT WIFI NETWORK (USB) ")
-                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-                
-                let items: Vec<ListItem> = app.available_ssids
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        let style = if i == app.wifi_selection_index {
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::White)
-                        };
-                        ListItem::new(format!(" {} ", s)).style(style)
-                    })
-                    .collect();
-
-                let list = List::new(items)
-                    .block(Block::default().borders(Borders::NONE))
-                    .highlight_symbol(">> ");
-
-                let hint = Paragraph::new("Arrows: Select | Enter: Password | Esc: Cancel")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray));
-
-                let inner = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Min(0),
-                        Constraint::Length(1),
-                    ].as_ref())
-                    .margin(2)
-                    .split(area);
-
-                f.render_widget(block, area);
-                f.render_widget(list, inner[0]);
-                f.render_widget(hint, inner[1]);
+                let items: Vec<ListItem> = app.available_ssids.iter().enumerate().map(|(i, s)| {
+                    let style = if i == app.wifi_selection_index { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) };
+                    ListItem::new(s.as_str()).style(style)
+                }).collect();
+                let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" WIFI SCAN "));
+                f.render_widget(list, area);
 
             } else if app.screen == Screen::WifiPasswordInput {
                 let area = centered_rect(60, 20, size);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" PASSWORD FOR [{}] ", app.selected_ssid))
-                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-
-                let asterisks: String = "*".repeat(app.wifi_password_input.len());
-                let input_text = format!(" Password: {}_", asterisks);
-                let input = Paragraph::new(input_text)
-                    .style(Style::default().fg(Color::Yellow))
-                    .block(block);
-
-                let hint = Paragraph::new("Enter: Connect  |  Esc: Cancel")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray));
-
-                let inner = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                        Constraint::Min(0),
-                    ].as_ref())
-                    .split(area);
-
+                let asterisks = "*".repeat(app.wifi_password_input.len());
+                let input = Paragraph::new(format!(" Password: {}_", asterisks)).block(Block::default().borders(Borders::ALL).title(" WIFI PASSWORD "));
                 f.render_widget(input, area);
-                f.render_widget(hint, inner[2]);
+
+            } else if app.screen == Screen::WaypointList {
+                let area = centered_rect(60, 70, size);
+                let mut items: Vec<ListItem> = app.waypoints.iter().enumerate().map(|(i, wp)| {
+                    let style = if i == app.waypoint_selection_index { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) };
+                    ListItem::new(format!("  {} ({:.2}, {:.2})", wp.name, wp.x, wp.y)).style(style)
+                }).collect();
+                items.push(ListItem::new("  [+] SAVE CURRENT POSITION ").style(Style::default().fg(Color::Green)));
+                let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" WAYPOINTS - [ENTER] to Nav | [P] to Init Pose | [DEL] to Remove "));
+                f.render_widget(list, area);
+
+            } else if app.screen == Screen::WaypointNameInput {
+                let area = centered_rect(60, 20, size);
+                let input = Paragraph::new(format!(" Name: {}_", app.waypoint_name_input))
+                    .block(Block::default().borders(Borders::ALL).title(" NAME NEW WAYPOINT "));
+                f.render_widget(input, area);
 
             } else {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3), // Header
-                        Constraint::Min(0),    // Main Body
-                        Constraint::Length(3), // Footer
-                    ].as_ref())
-                    .split(size);
+                let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3)]).split(size);
+                let body_chunks = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(33), Constraint::Percentage(27), Constraint::Percentage(40)]).split(chunks[1]);
 
-                let body_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(33), // Menu
-                        Constraint::Percentage(27), // Odom
-                        Constraint::Percentage(40), // Logs
-                    ].as_ref())
-                    .split(chunks[1]);
-
-                // 1. Header with dynamic status
-                let spinner = if app.active_process.is_some() {
-                    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-                    frames[app.spinner_frame]
-                } else {
-                    " "
-                };
-
-                let status_color = match app.operation_status.as_str() {
-                    "MAPPING" => Color::Magenta,
-                    "NAVIGATION" => Color::Green,
-                    "BRINGUP" => Color::Blue,
-                    _ => Color::DarkGray,
-                };
-
-                let header_text = vec![
-                    Span::styled(format!(" {}  ", spinner), Style::default().fg(Color::Cyan)),
-                    Span::styled("TRIDENT v0.2.0 ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" [ {} ] ", app.operation_status), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  {} ", spinner), Style::default().fg(Color::Cyan)),
-                ];
-
-                let header = Paragraph::new(Line::from(header_text))
+                let header = Paragraph::new("TRIDENT v0.2.0")
                     .alignment(Alignment::Center)
-                    .block(Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Thick)
-                        .border_style(Style::default().fg(Color::Cyan)));
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
                 
-                // 2. Menu
-                let filtered_menu = app.get_filtered_menu();
-                let menu_items: Vec<ListItem> = filtered_menu.iter().enumerate()
-                    .map(|(i, item)| {
-                        let style = if i == app.active_menu_index {
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD).bg(Color::Rgb(40, 40, 40))
-                        } else {
-                            Style::default().fg(Color::White)
-                        };
-                        ListItem::new(format!("  {}", item.to_string())).style(style)
-                    }).collect();
-                
-                let menu_list = List::new(menu_items)
-                    .block(Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Plain)
-                        .title(" OPERATIONS ")
-                        .border_style(Style::default().fg(Color::DarkGray)));
+                let menu_items: Vec<ListItem> = app.get_filtered_menu().iter().enumerate().map(|(i, item)| {
+                    let style = if i == app.active_menu_index { Style::default().fg(Color::Yellow).bg(Color::Rgb(40,40,40)) } else { Style::default().fg(Color::White) };
+                    ListItem::new(format!("  {}", item.to_string())).style(style)
+                }).collect();
+                let menu_list = List::new(menu_items).block(Block::default().borders(Borders::ALL).title(" OPERATIONS "));
 
-                // 3. Telemetry
                 let t = &app.current_telemetry;
                 let odom_text = vec![
-                    Line::from(vec![
-                        Span::styled(" [POS_X] ", Style::default().fg(Color::Cyan)),
-                        Span::styled(format!("{:.3} m", t.x), Style::default().fg(Color::Yellow)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(" [POS_Y] ", Style::default().fg(Color::Cyan)),
-                        Span::styled(format!("{:.3} m", t.y), Style::default().fg(Color::Yellow)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(" [THETA] ", Style::default().fg(Color::Cyan)),
-                        Span::styled(format!("{:.3} rad", t.theta), Style::default().fg(Color::Yellow)),
-                    ]),
+                    Line::from(vec![Span::styled(" [X] ", Style::default().fg(Color::Cyan)), Span::raw(format!("{:.3} m", t.x))]),
+                    Line::from(vec![Span::styled(" [Y] ", Style::default().fg(Color::Cyan)), Span::raw(format!("{:.3} m", t.y))]),
+                    Line::from(vec![Span::styled(" [θ] ", Style::default().fg(Color::Cyan)), Span::raw(format!("{:.3} rad", t.theta))]),
                 ];
-                let odom_panel = Paragraph::new(odom_text)
-                    .block(Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Plain)
-                        .title(" TELEMETRY ")
-                        .border_style(Style::default().fg(Color::DarkGray)));
+                let odom_panel = Paragraph::new(odom_text).block(Block::default().borders(Borders::ALL).title(" TELEMETRY "));
 
-                // 4. Logs
-                let display_logs = if app.logs.len() > 15 {
-                    &app.logs[app.logs.len() - 15..]
-                } else {
-                    &app.logs[..]
-                };
-                let logs: Vec<ListItem> = display_logs.iter()
-                    .map(|s| {
-                        let color = if s.contains("Error") || s.contains("Failed") || s.contains("DISCONNECTED") || s.contains("CRITICAL") { Color::Red } 
-                                   else if s.contains("RUN ON") { Color::Cyan }
-                                   else if s.contains("Warning") || s.contains("LOW") || s.contains("CAPPED") || s.contains("Throttling") { Color::Yellow }
-                                   else if s.contains("launched") || s.contains("complete") || s.contains("CONNECTED") || s.contains("STABLE") || s.contains("OK") { Color::Green }
-                                   else { Color::Gray };
-                        ListItem::new(format!("> {}", s)).style(Style::default().fg(color))
-                    }).collect();
-                
-                let logs_panel = List::new(logs)
-                    .block(Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Plain)
-                        .title(" SYSTEM LOGS ")
-                        .border_style(Style::default().fg(Color::DarkGray)));
+                let display_logs = if app.logs.len() > 15 { &app.logs[app.logs.len()-15..] } else { &app.logs[..] };
+                let logs: Vec<ListItem> = display_logs.iter().map(|s| {
+                    let color = if s.contains("Error") { Color::Red } else if s.contains("complete") { Color::Green } else { Color::Gray };
+                    ListItem::new(format!("> {}", s)).style(Style::default().fg(color))
+                }).collect();
+                let logs_panel = List::new(logs).block(Block::default().borders(Borders::ALL).title(" SYSTEM LOGS "));
 
-                // 5. Footer
-                let footer_text = Line::from(vec![
-                    Span::styled(" ROLE: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(app.device_type.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::styled(" SELECT  ", Style::default().fg(Color::White)),
-                    Span::styled("|  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("ENTER", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::styled(" EXECUTE  ", Style::default().fg(Color::White)),
-                    Span::styled("|  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("Q", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                    Span::styled(" QUIT  ", Style::default().fg(Color::White)),
-                    Span::styled("|  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("C", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::styled(" CLEAR LOGS ", Style::default().fg(Color::White)),
-                ]);
-
-                let footer = Paragraph::new(footer_text)
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray))
-                    .block(Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Plain)
-                        .border_style(Style::default().fg(Color::DarkGray)));
+                let footer = Paragraph::new(" role: ".to_owned() + app.device_type.to_string() + " | arrows: select | enter: exec | r: reset odom | q: quit")
+                    .alignment(Alignment::Center).block(Block::default().borders(Borders::ALL));
 
                 f.render_widget(header, chunks[0]);
                 f.render_widget(menu_list, body_chunks[0]);
@@ -1222,27 +1000,15 @@ async fn run_app<B: ratatui::backend::Backend>(
         if crossterm::event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if app.screen == Screen::Banner {
-                    match key.code {
-                        KeyCode::Enter => app.screen = Screen::DeviceSelect,
-                        KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
-                        _ => {}
-                    }
-                } else if app.screen == Screen::Splash {
-                    app.screen = Screen::DeviceSelect; // Skip splash on any key
+                    match key.code { KeyCode::Enter => app.screen = Screen::DeviceSelect, KeyCode::Char('q') => return Ok(()), _ => {} }
                 } else if app.screen == Screen::DeviceSelect {
                     match key.code {
                         KeyCode::Up => if app.selection_index > 0 { app.selection_index -= 1; },
                         KeyCode::Down => if app.selection_index < 1 { app.selection_index += 1; },
                         KeyCode::Enter => {
                             app.device_type = if app.selection_index == 0 { DeviceType::Titan } else { DeviceType::Laptop };
-                            
-                            // Initialize diagnostics and splash after selection
-                            app.startup_checks.clear();
-                            app.run_diagnostics();
-                            app.splash_start = std::time::Instant::now();
-                            app.screen = Screen::Splash;
+                            app.run_diagnostics(); app.splash_start = std::time::Instant::now(); app.screen = Screen::Splash;
                         },
-                        KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
                         _ => {}
                     }
                 } else if app.screen == Screen::MapNameInput {
@@ -1251,141 +1017,80 @@ async fn run_app<B: ratatui::backend::Backend>(
                         KeyCode::Backspace => { app.map_name_input.pop(); },
                         KeyCode::Char(c) => { app.map_name_input.push(c); },
                         KeyCode::Enter => {
-                            if !app.map_name_input.trim().is_empty() {
-                                let name = app.map_name_input.trim().to_string();
-                                app.logs.push(format!("Saving map as: {}...", name));
-                                
+                            if !app.map_name_input.is_empty() {
+                                let name = app.map_name_input.clone();
                                 let path = format!("/home/pidev/titan_ws/src/titan_bringup/maps/{}", name);
-                                let output = Command::new("ros2")
-                                    .args([
-                                        "run", "nav2_map_server", "map_saver_cli", 
-                                        "-f", &path
-                                    ])
-                                    .output();
-                                app.handle_output(output, &format!("Map '{}' saved.", name));
+                                let output = Command::new("ros2").args(["run", "nav2_map_server", "map_saver_cli", "-f", &path]).output();
+                                app.handle_output(output, &format!("Map {} saved.", name));
                                 app.screen = Screen::Main;
+                            }
+                        }, _ => {}
+                    }
+                } else if app.screen == Screen::WaypointList {
+                    match key.code {
+                        KeyCode::Esc => app.screen = Screen::Main,
+                        KeyCode::Up => if app.waypoint_selection_index > 0 { app.waypoint_selection_index -= 1; },
+                        KeyCode::Down => if app.waypoint_selection_index < app.waypoints.len() { app.waypoint_selection_index += 1; },
+                        KeyCode::Enter => {
+                            if app.waypoint_selection_index == app.waypoints.len() {
+                                app.screen = Screen::WaypointNameInput;
+                                app.waypoint_name_input.clear();
+                            } else {
+                                let wp = app.waypoints[app.waypoint_selection_index].clone();
+                                let _ = app.ros_cmd_tx.send(RosCommand::NavTo(wp));
+                                app.logs.push(format!("Sending Nav goal to: {}", app.waypoints[app.waypoint_selection_index].name));
+                                app.screen = Screen::Main;
+                            }
+                        },
+                        KeyCode::Char('p') | KeyCode::Char('P') => {
+                            if app.waypoint_selection_index < app.waypoints.len() {
+                                let wp = app.waypoints[app.waypoint_selection_index].clone();
+                                let _ = app.ros_cmd_tx.send(RosCommand::SetPose(wp));
+                                app.logs.push(format!("Initialized Pose at: {}", app.waypoints[app.waypoint_selection_index].name));
+                                app.screen = Screen::Main;
+                            }
+                        },
+                        KeyCode::Delete => {
+                            if app.waypoint_selection_index < app.waypoints.len() {
+                                app.waypoints.remove(app.waypoint_selection_index);
+                                app.save_waypoints();
                             }
                         },
                         _ => {}
                     }
-                } else if app.screen == Screen::TeleopConfig {
-                    if key.kind == crossterm::event::KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Esc => app.screen = Screen::Main,
-                            KeyCode::Tab | KeyCode::Down => {
-                                app.teleop_field_index = (app.teleop_field_index + 1) % 2;
-                            },
-                            KeyCode::Up => {
-                                app.teleop_field_index = if app.teleop_field_index == 0 { 1 } else { 0 };
-                            },
-                            KeyCode::Backspace => {
-                                if app.teleop_field_index == 0 { app.teleop_speed.pop(); }
-                                else { app.teleop_turn.pop(); }
-                            },
-                            KeyCode::Delete => {
-                                if app.teleop_field_index == 0 { app.teleop_speed.clear(); }
-                                else { app.teleop_turn.clear(); }
-                            },
-                            KeyCode::Char(c) => {
-                                if c.is_digit(10) || c == '.' || c == '-' {
-                                    if app.teleop_field_index == 0 { app.teleop_speed.push(c); }
-                                    else { app.teleop_turn.push(c); }
-                                }
-                            },
-                            KeyCode::Enter => {
-                                if app.teleop_field_index == 0 {
-                                    app.teleop_field_index = 1;
-                                } else {
-                                    app.execute_selected();
-                                }
-                            },
-                            _ => {}
-                        }
-                    }
-                } else if app.screen == Screen::MapSelect {
-                    if key.kind == crossterm::event::KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Esc => app.screen = Screen::Main,
-                            KeyCode::Up => {
-                                if app.map_selection_index > 0 { app.map_selection_index -= 1; }
-                            },
-                            KeyCode::Down => {
-                                if app.map_selection_index < app.available_maps.len().saturating_sub(1) {
-                                    app.map_selection_index += 1;
-                                }
-                            },
-                            KeyCode::Enter => {
-                                app.execute_selected();
-                            },
-                            _ => {}
-                        }
-                    }
-                } else if app.screen == Screen::RVizConfigSelect {
-                    if key.kind == crossterm::event::KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Esc => app.screen = Screen::Main,
-                            KeyCode::Up => {
-                                if app.rviz_config_selection_index > 0 { app.rviz_config_selection_index -= 1; }
-                            },
-                            KeyCode::Down => {
-                                if app.rviz_config_selection_index < app.available_rviz_configs.len().saturating_sub(1) {
-                                    app.rviz_config_selection_index += 1;
-                                }
-                            },
-                            KeyCode::Enter => {
-                                app.execute_selected();
-                            },
-                            _ => {}
-                        }
-                    }
-                } else if app.screen == Screen::WifiScan {
-                    if key.kind == crossterm::event::KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Esc => {
-                                app.screen = Screen::Main;
-                            },
-                            KeyCode::Up => {
-                                if app.wifi_selection_index > 0 { app.wifi_selection_index -= 1; }
-                            },
-                            KeyCode::Down => {
-                                if app.wifi_selection_index < app.available_ssids.len().saturating_sub(1) {
-                                    app.wifi_selection_index += 1;
-                                }
-                            },
-                            KeyCode::Enter => {
-                                app.selected_ssid = app.available_ssids[app.wifi_selection_index].clone();
-                                app.wifi_password_input.clear();
-                                app.screen = Screen::WifiPasswordInput;
-                            },
-                            _ => {}
-                        }
-                    }
-                } else if app.screen == Screen::WifiPasswordInput {
-                    if key.kind == crossterm::event::KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Esc => {
-                                app.screen = Screen::WifiScan;
-                            },
-                            KeyCode::Backspace => { app.wifi_password_input.pop(); },
-                            KeyCode::Char(c) => { app.wifi_password_input.push(c); },
-                            KeyCode::Enter => {
-                                app.perform_wifi_connection();
-                            },
-                            _ => {}
-                        }
-                    }
-                } else {
+                } else if app.screen == Screen::WaypointNameInput {
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
-                        KeyCode::Char('c') | KeyCode::Char('C') => app.logs.clear(),
+                        KeyCode::Esc => app.screen = Screen::WaypointList,
+                        KeyCode::Backspace => { app.waypoint_name_input.pop(); },
+                        KeyCode::Char(c) => { app.waypoint_name_input.push(c); },
+                        KeyCode::Enter => {
+                            if !app.waypoint_name_input.is_empty() {
+                                let wp = Waypoint {
+                                    name: app.waypoint_name_input.clone(),
+                                    x: app.current_telemetry.x,
+                                    y: app.current_telemetry.y,
+                                    theta: app.current_telemetry.theta,
+                                };
+                                app.waypoints.push(wp);
+                                app.save_waypoints();
+                                app.screen = Screen::WaypointList;
+                            }
+                        }, _ => {}
+                    }
+                } else if app.screen == Screen::Main {
+                    match key.code {
                         KeyCode::Up => if app.active_menu_index > 0 { app.active_menu_index -= 1; },
-                        KeyCode::Down => {
-                            let max = app.get_filtered_menu().len().saturating_sub(1);
-                            if app.active_menu_index < max { app.active_menu_index += 1; }
-                        },
+                        KeyCode::Down => if app.active_menu_index < app.get_filtered_menu().len()-1 { app.active_menu_index += 1; },
                         KeyCode::Enter => app.execute_selected(),
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            let _ = app.ros_cmd_tx.send(RosCommand::ResetOdom);
+                            app.logs.push("Sent Odometry Reset command.".to_string());
+                        },
+                        KeyCode::Char('q') => return Ok(()),
                         _ => {}
                     }
+                } else {
+                     match key.code { KeyCode::Esc => app.screen = Screen::Main, _ => {} }
                 }
             }
         }
@@ -1394,47 +1099,15 @@ async fn run_app<B: ratatui::backend::Backend>(
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ].as_ref())
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ].as_ref())
-        .split(popup_layout[1])[1]
+    let popup_layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Percentage((100 - percent_y) / 2), Constraint::Percentage(percent_y), Constraint::Percentage((100 - percent_y) / 2)]).split(r);
+    Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage((100 - percent_x) / 2), Constraint::Percentage(percent_x), Constraint::Percentage((100 - percent_x) / 2)]).split(popup_layout[1])[1]
 }
 
 fn render_loader(f: &mut ratatui::Frame, message: &str, frame: usize) {
     let area = centered_rect(60, 20, f.size());
     let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-    let spinner = frames[frame % 8];
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Thick)
-        .border_style(Style::default().fg(Color::Yellow));
-
-    let text = vec![
-        Line::from(vec![
-            Span::styled(format!(" {} ", spinner), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(message, Style::default().fg(Color::White)),
-        ]),
-        Line::from(" Please wait... "),
-    ];
-
-    let paragraph = Paragraph::new(text)
-        .block(block)
-        .alignment(Alignment::Center);
-
-    f.render_widget(ratatui::widgets::Clear, area); // Clear background
+    let text = vec![Line::from(format!(" {} {}", frames[frame % 8], message)), Line::from(" Please wait... ")];
+    let paragraph = Paragraph::new(text).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow))).alignment(Alignment::Center);
+    f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(paragraph, area);
 }
