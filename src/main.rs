@@ -1090,8 +1090,23 @@ async fn run_app<B: ratatui::backend::Backend>(
                             if !app.map_name_input.is_empty() {
                                 let name = app.map_name_input.clone();
                                 let path = format!("/home/pidev/titan_ws/src/titan_bringup/maps/{}", name);
-                                let output = Command::new("ros2").args(["run", "nav2_map_server", "map_saver_cli", "-f", &path]).output();
-                                app.handle_output(output, &format!("Map {} saved.", name));
+                                let output = Command::new("ros2")
+                                    .args(["run", "nav2_map_server", "map_saver_cli", "-f", &path])
+                                    .output();
+                                
+                                if let Ok(ref out) = output {
+                                    if out.status.success() {
+                                        let pgm_path = format!("{}.pgm", path);
+                                        let _ = Command::new("python3")
+                                            .args(["/home/pidev/titan_ws/scripts/clean_map.py", &pgm_path])
+                                            .output();
+                                        app.handle_output(output, &format!("Map {} saved and post-processed.", name));
+                                    } else {
+                                        app.handle_output(output, &format!("Failed to save map {}.", name));
+                                    }
+                                } else {
+                                    app.handle_output(output, &format!("Failed to execute map_saver for {}.", name));
+                                }
                                 app.screen = Screen::Main;
                             }
                         }, _ => {}
