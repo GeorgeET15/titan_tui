@@ -47,3 +47,10 @@ trident
 - **UI**: `ratatui` (Custom Tactical Frame)
 - **ROS 2**: `r2r` (Native Odometry Integration)
 - **Shell**: Bash (Automated Deployment)
+
+## 📖 Documentation
+Detailed guides for all robot features are available in the [TITAN Workspace Docs](https://github.com/GeorgeET15/titan_ws/tree/main/docs):
+- [Bringup & Hardware](https://github.com/GeorgeET15/titan_ws/blob/main/docs/bringup.md)
+- [Mapping & SLAM](https://github.com/GeorgeET15/titan_ws/blob/main/docs/mapping.md)
+- [Autonomous Navigation](https://github.com/GeorgeET15/titan_ws/blob/main/docs/navigation.md)
+- [Waypoint Management](https://github.com/GeorgeET15/titan_ws/blob/main/docs/waypoints.md)
