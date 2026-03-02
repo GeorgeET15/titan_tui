@@ -867,7 +867,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     .map(|s| {
                         let color = if s.contains("NOT FOUND") || s.contains("DISCONNECTED") || s.contains("CRITICAL") { Color::Red }
                                    else if s.contains("Warning") || s.contains("LOW") { Color::Yellow }
-                                   else if s.contains("OK") || s.contains("CONNECTED") { Color::Green }
+                                   else if s.contains("OK") || s.contains("CONNECTED") || s.contains("STABLE") { Color::Green }
                                    else { Color::Gray };
                         ListItem::new(s.as_str()).style(Style::default().fg(color))
                     }).collect();
