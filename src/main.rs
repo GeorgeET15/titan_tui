@@ -1098,7 +1098,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     if out.status.success() {
                                         let pgm_path = format!("{}.pgm", path);
                                         let _ = Command::new("python3")
-                                            .args(["/home/pidev/titan_ws/scripts/clean_map.py", &pgm_path])
+                                            .args(["/home/pidev/titan_tui/scripts/clean_map.py", &pgm_path])
                                             .output();
                                         app.handle_output(output, &format!("Map {} saved and post-processed.", name));
                                     } else {
