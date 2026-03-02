@@ -138,6 +138,7 @@ struct App {
     // WiFi Management
     available_ssids: Vec<String>,
     wifi_selection_index: usize,
+    #[allow(dead_code)]
     selected_ssid: String,
     wifi_password_input: String,
     
@@ -398,6 +399,7 @@ impl App {
         self.is_loading = false;
     }
 
+    #[allow(dead_code)]
     fn perform_wifi_connection(&mut self) {
         self.is_loading = true;
         self.loading_message = format!("Connecting to {}...", self.selected_ssid);
